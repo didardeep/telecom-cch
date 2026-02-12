@@ -1,0 +1,71 @@
+import { Routes, Route, Navigate } from 'react-router-dom';
+import { useAuth } from './AuthContext';
+import HomePage from './pages/HomePage';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import CustomerLayout from './pages/customer/CustomerLayout';
+import CustomerDashboard from './pages/customer/CustomerDashboard';
+import ChatSupport from './pages/customer/ChatSupport';
+import FeedbackPage from './pages/customer/FeedbackPage';
+import ManagerLayout from './pages/manager/ManagerLayout';
+import ManagerDashboard from './pages/manager/ManagerDashboard';
+import ManagerChatSupport from './pages/manager/ManagerChatSupport';
+import ActiveTickets from './pages/manager/ActiveTickets';
+import IssueTracking from './pages/manager/IssueTracking';
+import ChatDetail from './pages/manager/ChatDetail';
+import CTOLayout from './pages/cto/CTOLayout';
+import CTODashboard from './pages/cto/CTODashboard';
+
+function ProtectedRoute({ children, roles }) {
+  const { user, loading } = useAuth();
+  if (loading) return <div className="page-loader"><div className="spinner" /></div>;
+  if (!user) return <Navigate to="/login" />;
+  if (roles && !roles.includes(user.role)) return <Navigate to="/login" />;
+  return children;
+}
+
+export default function App() {
+  const { user } = useAuth();
+
+  const getDashboardPath = () => {
+    if (!user) return '/login';
+    if (user.role === 'customer') return '/customer/dashboard';
+    if (user.role === 'manager') return '/manager/dashboard';
+    if (user.role === 'cto') return '/cto/dashboard';
+    return '/login';
+  };
+
+  return (
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/login" element={user ? <Navigate to={getDashboardPath()} /> : <LoginPage />} />
+      <Route path="/register" element={user ? <Navigate to={getDashboardPath()} /> : <RegisterPage />} />
+
+      {/* Customer Routes */}
+      <Route path="/customer" element={<ProtectedRoute roles={['customer']}><CustomerLayout /></ProtectedRoute>}>
+        <Route path="dashboard" element={<CustomerDashboard />} />
+        <Route path="chat" element={<ChatSupport />} />
+        <Route path="feedback" element={<FeedbackPage />} />
+      </Route>
+
+      {/* Manager Routes */}
+      <Route path="/manager" element={<ProtectedRoute roles={['manager']}><ManagerLayout /></ProtectedRoute>}>
+        <Route path="dashboard" element={<ManagerDashboard />} />
+        <Route path="chat" element={<ManagerChatSupport />} />
+        <Route path="tickets" element={<ActiveTickets />} />
+        <Route path="tracking" element={<IssueTracking />} />
+        <Route path="chat-detail/:id" element={<ChatDetail />} />
+      </Route>
+
+      {/* CTO Routes */}
+      <Route path="/cto" element={<ProtectedRoute roles={['cto']}><CTOLayout /></ProtectedRoute>}>
+        <Route path="dashboard" element={<CTODashboard />} />
+        <Route path="tickets" element={<ActiveTickets />} />
+        <Route path="tracking" element={<IssueTracking />} />
+        <Route path="chat-detail/:id" element={<ChatDetail />} />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" />} />
+    </Routes>
+  );
+}

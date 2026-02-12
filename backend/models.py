@@ -1,0 +1,160 @@
+"""
+Database Models for Telecom Complaint Handling System
+"""
+
+from datetime import datetime, timezone
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+
+db = SQLAlchemy()
+bcrypt = Bcrypt()
+
+
+class User(db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    role = db.Column(db.String(20), nullable=False, default="customer")  # customer, manager, cto
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    chat_sessions = db.relationship("ChatSession", backref="user", lazy=True)
+    tickets = db.relationship("Ticket", backref="user", lazy=True, foreign_keys="Ticket.user_id")
+    feedbacks = db.relationship("Feedback", backref="user", lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    def check_password(self, password):
+        return bcrypt.check_password_hash(self.password_hash, password)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "email": self.email,
+            "role": self.role,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ChatSession(db.Model):
+    __tablename__ = "chat_sessions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    sector_name = db.Column(db.String(200), default="")
+    subprocess_name = db.Column(db.String(200), default="")
+    query_text = db.Column(db.Text, default="")
+    resolution = db.Column(db.Text, default="")
+    status = db.Column(db.String(30), default="active")  # active, resolved, escalated
+    language = db.Column(db.String(50), default="English")
+    summary = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at = db.Column(db.DateTime, nullable=True)
+
+    messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
+    ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "user_name": self.user.name if self.user else "",
+            "user_email": self.user.email if self.user else "",
+            "sector_name": self.sector_name,
+            "subprocess_name": self.subprocess_name,
+            "query_text": self.query_text,
+            "resolution": self.resolution,
+            "status": self.status,
+            "language": self.language,
+            "summary": self.summary,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "ticket_id": self.ticket.id if self.ticket else None,
+        }
+
+
+class ChatMessage(db.Model):
+    __tablename__ = "chat_messages"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
+    sender = db.Column(db.String(20), nullable=False)  # user, bot, system
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "sender": self.sender,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Ticket(db.Model):
+    __tablename__ = "tickets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    chat_session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    reference_number = db.Column(db.String(50), unique=True, nullable=False)
+    category = db.Column(db.String(200), default="General")
+    subcategory = db.Column(db.String(200), default="")
+    description = db.Column(db.Text, default="")
+    status = db.Column(db.String(30), default="pending")  # pending, in_progress, resolved, escalated
+    priority = db.Column(db.String(20), default="medium")  # low, medium, high, critical
+    assigned_to = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    resolution_notes = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at = db.Column(db.DateTime, nullable=True)
+
+    assignee = db.relationship("User", foreign_keys=[assigned_to], backref="assigned_tickets")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "chat_session_id": self.chat_session_id,
+            "user_id": self.user_id,
+            "user_name": self.user.name if self.user else "",
+            "user_email": self.user.email if self.user else "",
+            "reference_number": self.reference_number,
+            "category": self.category,
+            "subcategory": self.subcategory,
+            "description": self.description,
+            "status": self.status,
+            "priority": self.priority,
+            "assigned_to": self.assigned_to,
+            "assignee_name": self.assignee.name if self.assignee else "Unassigned",
+            "resolution_notes": self.resolution_notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
+class Feedback(db.Model):
+    __tablename__ = "feedbacks"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    chat_session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=True)
+    rating = db.Column(db.Integer, default=0)  # 1-5
+    comment = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    chat_session = db.relationship("ChatSession", backref="feedbacks")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "user_name": self.user.name if self.user else "",
+            "chat_session_id": self.chat_session_id,
+            "rating": self.rating,
+            "comment": self.comment,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
