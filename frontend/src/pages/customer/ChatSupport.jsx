@@ -111,9 +111,8 @@ export default function ChatSupport() {
       subprocessKey: null, subprocessName: null, language: 'English',
       queryText: '', resolution: '',
     };
+    sessionIdRef.current = null;
     hideInput();
-
-    await createSession();
 
     const welcomeGroupId = nextId();
     setTimeout(() => {
@@ -196,7 +195,17 @@ export default function ChatSupport() {
     setInputValue('');
     hideInput();
     stateRef.current.queryText = text;
-    saveMessage('user', text, { query_text: text });
+
+    // Create session on first user message (deferred from startChat)
+    if (!sessionIdRef.current) {
+      await createSession();
+    }
+
+    saveMessage('user', text, {
+      query_text: text,
+      sector_name: stateRef.current.sectorName,
+      subprocess_name: stateRef.current.subprocessName,
+    });
 
     setIsTyping(true);
     try {
@@ -280,22 +289,10 @@ export default function ChatSupport() {
     if (sessionIdRef.current) {
       try {
         const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/resolve`, {
+        await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/resolve`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         });
-        const data = await resp.json();
-        if (data.summary) {
-          addMessage({
-            type: 'system',
-            text: `Chat summary has been saved to your account.`,
-          });
-          // Show "Send Summary to Email" button
-          setTimeout(() => {
-            const emailGroupId = nextId();
-            addMessage({ type: 'email-action', groupId: emailGroupId });
-          }, 500);
-        }
       } catch {}
     }
 
@@ -303,20 +300,43 @@ export default function ChatSupport() {
       addMessage({ type: 'bot', html: `What would you like to do next?` });
       const actionGroupId = nextId();
       addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-    }, 2000);
+    }, 1500);
     stateRef.current.step = 'resolved';
   }, [addMessage, disableGroup, saveMessage]);
 
-  // ── Unsatisfied ──
-  const handleUnsatisfied = useCallback((groupId) => {
+  // ── Unsatisfied → Auto-escalate ──
+  const handleUnsatisfied = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'No, my issue is not resolved' });
-    addMessage({ type: 'bot', html: `I'm sorry the steps didn't resolve your issue. Here's what we can do next:` });
     saveMessage('user', 'No, my issue is not resolved');
+
+    // Auto-escalate session and raise ticket
+    let refNum = '';
+    if (sessionIdRef.current) {
+      try {
+        const token = getToken();
+        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        });
+        const data = await resp.json();
+        if (data.ticket) {
+          refNum = data.ticket.reference_number;
+        }
+      } catch {}
+    }
+
+    addMessage({
+      type: 'bot',
+      html: `We're sorry we couldn't resolve your issue. A support ticket has been raised and a customer support executive will contact you shortly.` +
+        (refNum ? `<br><br>Your reference number: <strong>${refNum}</strong><br>Please save this for future reference.` : ''),
+    });
+
     setTimeout(() => {
-      const unsatGroupId = nextId();
-      addMessage({ type: 'unsat-options', groupId: unsatGroupId });
-    }, 400);
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+    }, 1000);
+    stateRef.current.step = 'escalated';
   }, [addMessage, disableGroup, saveMessage]);
 
   // ── Back to Menu ──
@@ -328,12 +348,29 @@ export default function ChatSupport() {
     stateRef.current.step = 'sector';
   }, [addMessage, disableGroup, loadSectorMenu]);
 
-  // ── Exit ──
-  const handleExit = useCallback((groupId) => {
+  // ── Exit → Send summary email + goodbye ──
+  const handleExit = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Exit' });
-    addMessage({ type: 'exit-box' });
     hideInput();
+
+    // Send chat summary email automatically on exit
+    if (sessionIdRef.current) {
+      addMessage({ type: 'system', text: 'Sending chat summary to your email...' });
+      try {
+        const token = getToken();
+        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/send-summary-email`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          addMessage({ type: 'email-sent', message: data.message });
+        }
+      } catch {}
+    }
+
+    addMessage({ type: 'exit-box' });
     stateRef.current.step = 'exited';
   }, [addMessage, disableGroup, hideInput]);
 
@@ -483,7 +520,7 @@ export default function ChatSupport() {
       case 'thankyou':
         return (
           <div key={msg.id} className="thankyou-box">
-            <div className="ty-icon">&#x1F389;</div>
+            <div className="ty-icon"></div>
             <div className="ty-title">Thank You!</div>
             <div className="ty-msg">We're glad we could help resolve your issue.<br />If you face any other telecom issues, feel free to come back anytime!</div>
           </div>
@@ -502,7 +539,7 @@ export default function ChatSupport() {
       case 'exit-box':
         return (
           <div key={msg.id} className="exit-box">
-            <div className="exit-icon">&#x1F44B;</div>
+            <div className="exit-icon"></div>
             <div className="exit-title">Goodbye!</div>
             <div className="exit-msg">Thank you for using Customer Handling.<br />Have a great day! Click <strong>Restart</strong> anytime to start a new session.</div>
           </div>
@@ -510,10 +547,10 @@ export default function ChatSupport() {
 
       case 'unsat-options': {
         const options = [
-          { cls: 'retry', icon: '&#x1F504;', title: 'Describe Again', desc: 'Provide more details for better resolution steps', fn: () => handleRetry(msg.groupId) },
-          { cls: 'human', icon: '&#x1F464;', title: 'Connect to Human Agent', desc: 'A support ticket will be raised for you', fn: () => handleHumanHandoff(msg.groupId) },
-          { cls: 'newc', icon: '&#x1F4CB;', title: 'Main Menu', desc: 'Go back to the main service category menu', fn: () => handleBackToMenu(msg.groupId) },
-          { cls: 'exit', icon: '&#x1F6AA;', title: 'Exit', desc: 'End this session', fn: () => handleExit(msg.groupId) },
+          { cls: 'retry', icon: '', title: 'Describe Again', desc: 'Provide more details for better resolution steps', fn: () => handleRetry(msg.groupId) },
+          { cls: 'human', icon: '', title: 'Connect to Human Agent', desc: 'A support ticket will be raised for you', fn: () => handleHumanHandoff(msg.groupId) },
+          { cls: 'newc', icon: '', title: 'Main Menu', desc: 'Go back to the main service category menu', fn: () => handleBackToMenu(msg.groupId) },
+          { cls: 'exit', icon: '', title: 'Exit', desc: 'End this session', fn: () => handleExit(msg.groupId) },
         ];
         return (
           <div key={msg.id} className="unsat-options">
@@ -539,7 +576,7 @@ export default function ChatSupport() {
               className={`email-btn${isDisabled ? ' disabled' : ''}`}
               onClick={() => !isDisabled && handleSendEmail(msg.groupId)}
             >
-              <span className="email-btn-icon">&#x2709;</span>
+              <span className="email-btn-icon"></span>
               Send Summary to My Email
             </button>
           </div>
@@ -548,7 +585,7 @@ export default function ChatSupport() {
       case 'email-sent':
         return (
           <div key={msg.id} className="email-sent-box">
-            <div className="email-sent-icon">&#x2705;</div>
+            <div className="email-sent-icon"></div>
             <div className="email-sent-text">{msg.message}</div>
           </div>
         );
@@ -574,13 +611,13 @@ export default function ChatSupport() {
     <div className="chat-support-page">
       <div className="app-container">
         <div className="header">
-          <div className="header-icon">&#x1F4E1;</div>
+          <div className="header-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '32px', width: 'auto' }} /></div>
           <div className="header-info">
             <h1>Customer Handling</h1>
             <p>AI-powered multilingual support</p>
           </div>
           <div className="status-dot" />
-          <button className="restart-btn" onClick={startChat}>&#x21BB; Restart</button>
+          <button className="restart-btn" onClick={startChat}>Restart</button>
         </div>
 
         <div className="chat-area" ref={chatAreaRef}>
@@ -597,7 +634,7 @@ export default function ChatSupport() {
             <div className="input-row">
               <textarea ref={inputRef} value={inputValue} onChange={handleInputChange}
                 onKeyDown={handleKeyDown} placeholder={inputPlaceholder} rows={1} />
-              <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>&#x27A4;</button>
+              <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>Send</button>
             </div>
             <div className="input-hint">Press Enter to send &middot; Supports any language</div>
           </div>

@@ -15,7 +15,7 @@ export default function Sidebar({ links }) {
     <aside className="sidebar">
       <div className="sidebar-header">
         <div className="sidebar-brand" onClick={() => navigate('/')} style={{ cursor: 'pointer' }}>
-          <div className="sidebar-logo">📡</div>
+          <div className="sidebar-logo"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '32px', width: 'auto' }} /></div>
           <div className="sidebar-brand-text">
             <h3>Customer Handling</h3>
             <span>{user?.role} Portal</span>

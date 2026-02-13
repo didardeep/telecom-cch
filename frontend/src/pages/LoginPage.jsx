@@ -37,7 +37,7 @@ export default function LoginPage() {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-header">
-          <div className="auth-logo">📡</div>
+          <div className="auth-logo"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '48px', width: 'auto' }} /></div>
           <h2>Welcome Back</h2>
           <p>Sign in to your account</p>
         </div>

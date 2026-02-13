@@ -19,7 +19,7 @@ export default function HomePage() {
     <div className="home-page">
       <nav className="home-nav">
         <div className="home-logo">
-          <div className="home-logo-icon">📡</div>
+          <div className="home-logo-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '36px', width: 'auto' }} /></div>
           Customer Handling
         </div>
         <div className="home-nav-actions">
@@ -31,7 +31,7 @@ export default function HomePage() {
       <div className="home-hero">
         <div className="home-hero-content">
           <div className="home-badge">
-            🤖 AI-Powered Customer Support
+            AI-Powered Customer Support
           </div>
 
           <h1>
@@ -49,19 +49,15 @@ export default function HomePage() {
 
           <div className="home-features">
             <div className="home-feature">
-              <div className="home-feature-icon">💬</div>
               Multilingual AI Chat
             </div>
             <div className="home-feature">
-              <div className="home-feature-icon">🎫</div>
               Auto Ticket Escalation
             </div>
             <div className="home-feature">
-              <div className="home-feature-icon">📊</div>
               Manager Dashboard
             </div>
             <div className="home-feature">
-              <div className="home-feature-icon">⚡</div>
               Instant Resolutions
             </div>
           </div>

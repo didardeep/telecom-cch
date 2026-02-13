@@ -61,7 +61,7 @@ export default function CustomerDashboard() {
 
       <div className="section-card">
         <div className="section-card-header">
-          <h3>Recent Sessions</h3>
+          <h3>Sessions</h3>
           <button className="btn btn-primary btn-sm" onClick={() => navigate('/customer/chat')}>
             New Chat
           </button>

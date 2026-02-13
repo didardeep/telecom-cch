@@ -60,13 +60,13 @@ DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ORIGINAL CHATBOT CODE (integrated from app.py - UNCHANGED LOGIC)
+#  CHATBOT CODE 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TELECOM_MENU = {
     "1": {
         "name": "Mobile Services (Prepaid / Postpaid)",
-        "icon": "📱",
+        "icon": "",
         "description": "Covers all issues related to mobile phone services including voice calls, SMS, mobile data, SIM cards, prepaid recharges, postpaid billing, roaming, number portability, and mobile network coverage.",
         "subprocesses": {
             "1": {"name": "Billing & Payment Issues", "semantic_scope": "Unexpected charges, wrong bill amount, double billing, payment failed but money deducted, recharge not credited, balance deducted without usage, auto-renewal charged, EMI issues on phone, refund not received for telecom services, incorrect tax on bill, bill dispute"},
@@ -81,7 +81,7 @@ TELECOM_MENU = {
     },
     "2": {
         "name": "Broadband / Internet Services",
-        "icon": "🌐",
+        "icon": "",
         "description": "Covers all issues related to wired/wireless broadband, fiber internet, DSL connections, WiFi, and home/office internet services.",
         "subprocesses": {
             "1": {"name": "Slow Speed / No Connectivity", "semantic_scope": "Internet too slow, speed not matching plan, buffering while streaming, downloads very slow, no internet connection, WiFi connected but no internet, speed drops at night, latency/ping too high, speed test showing low results, bandwidth issue"},
@@ -95,7 +95,7 @@ TELECOM_MENU = {
     },
     "3": {
         "name": "DTH / Cable TV Services",
-        "icon": "📺",
+        "icon": "",
         "description": "Covers all issues related to Direct-To-Home television, cable TV, set-top boxes, and TV channel subscriptions.",
         "subprocesses": {
             "1": {"name": "Channel Not Working / Missing", "semantic_scope": "Channel not showing, channel removed from pack, channel black screen, paid channel not available, regional channel missing, HD channel not working, channel list changed, favorite channel gone"},
@@ -108,7 +108,7 @@ TELECOM_MENU = {
     },
     "4": {
         "name": "Landline / Fixed Line Services",
-        "icon": "☎️",
+        "icon": "",
         "description": "Covers all issues related to traditional landline phone services, fixed-line connections, and wired telephone services.",
         "subprocesses": {
             "1": {"name": "No Dial Tone / Dead Line", "semantic_scope": "Landline not working, no dial tone, line dead, phone silent, no sound when picking up receiver, line suddenly stopped working, connection cut off, cable damaged"},
@@ -121,7 +121,7 @@ TELECOM_MENU = {
     },
     "5": {
         "name": "Enterprise / Business Solutions",
-        "icon": "🏢",
+        "icon": "",
         "description": "Covers all issues related to business/corporate telecom solutions including leased lines, SLA-based services, bulk connections, cloud telephony, and managed network services.",
         "subprocesses": {
             "1": {"name": "SLA Breach / Service Downtime", "semantic_scope": "Service level agreement not met, uptime guarantee violated, business internet down, prolonged outage affecting business, compensation for downtime, SLA penalty claim, response time exceeded"},
@@ -354,9 +354,9 @@ def auto_assign_priority(query_text, subprocess_name):
     return "low"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
 # AUTH ROUTES
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
@@ -405,8 +405,8 @@ def get_me():
     return jsonify({"user": user.to_dict()})
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHATBOT ROUTES (from original app.py - UNCHANGED API)
+
+# CHATBOT ROUTES 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/menu", methods=["GET"])
@@ -714,7 +714,7 @@ def customer_dashboard():
 
     recent_sessions = ChatSession.query.filter_by(user_id=user_id).order_by(
         ChatSession.created_at.desc()
-    ).limit(5).all()
+    ).all()
 
     return jsonify({
         "stats": {
