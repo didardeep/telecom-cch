@@ -296,6 +296,46 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
 
 
+def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1):
+    """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
+    prev_block = ""
+    if previous_solutions:
+        prev_block = (
+            "\n\nIMPORTANT: The following solutions have ALREADY been provided and did NOT work. "
+            "Do NOT repeat them. Provide a DIFFERENT approach:\n"
+            + "\n---\n".join(previous_solutions)
+        )
+
+    query_block = ""
+    if user_query:
+        query_block = f"\n\nThe user described their specific issue as: \"{user_query}\""
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": (
+                    f"You are an expert telecom customer support agent. The user has an issue "
+                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    f"This is solution attempt #{attempt} of 5.\n\n"
+                    "Provide ONE focused, actionable solution with 2-3 clear steps. "
+                    "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
+                    "Acknowledge the issue briefly and give the steps."
+                    + query_block
+                    + prev_block +
+                    f"\n\nIMPORTANT: Respond entirely in {language}. "
+                    "Keep the tone professional, empathetic, and helpful."
+                )},
+                {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
+            ],
+            temperature=0.5,
+            max_tokens=500,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
+
+
 def translate_text(text: str, target_language: str) -> str:
     if target_language.lower() in ("english", "en"):
         return text
@@ -364,16 +404,13 @@ def register():
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    role = data.get("role", "customer").lower()
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
-    if role not in ("customer", "manager", "cto"):
-        return jsonify({"error": "Invalid role. Must be customer, manager, or cto"}), 400
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    user = User(name=name, email=email, role=role)
+    user = User(name=name, email=email, role="customer")
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -465,6 +502,44 @@ def resolve_complaint():
     })
 
 
+@app.route("/api/resolve-step", methods=["POST"])
+def resolve_step():
+    """Generate a single solution step. Used in the iterative resolution flow."""
+    data = request.json
+    sector_key = data.get("sector_key")
+    subprocess_key = data.get("subprocess_key")
+    user_query = data.get("query", "").strip()
+    language = data.get("language", "English")
+    previous_solutions = data.get("previous_solutions", [])
+    attempt = data.get("attempt", 1)
+
+    sector = TELECOM_MENU.get(sector_key, {})
+    sector_name = sector.get("name", "Telecom")
+    subprocess_name = get_subprocess_name(sector_key, subprocess_key)
+
+    # If user provided a query, check if it's telecom-related
+    if user_query:
+        if not is_telecom_related(user_query, sector_name=sector_name, subprocess_name=subprocess_name):
+            msg = (
+                "I'm sorry, but I can only assist with **telecom-related** complaints. "
+                "Your query doesn't appear to be telecom-related. Please try again."
+            )
+            translated_msg = translate_text(msg, language)
+            return jsonify({"resolution": translated_msg, "is_telecom": False})
+
+    solution = generate_single_solution(
+        sector_name, subprocess_name, language,
+        user_query=user_query,
+        previous_solutions=previous_solutions,
+        attempt=attempt,
+    )
+    return jsonify({
+        "resolution": solution,
+        "is_telecom": True,
+        "attempt": attempt,
+    })
+
+
 @app.route("/api/detect-language", methods=["POST"])
 def detect_lang():
     data = request.json
@@ -528,12 +603,16 @@ def resolve_session(session_id):
 
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
-
-    # Generate summary
-    msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
-    session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
-
     db.session.commit()
+
+    # Generate summary after commit so resolve is never blocked
+    try:
+        msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
+        session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
+        db.session.commit()
+    except Exception:
+        pass
+
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
@@ -728,6 +807,44 @@ def customer_dashboard():
     })
 
 
+@app.route("/api/customer/active-session", methods=["GET"])
+@jwt_required()
+def customer_active_session():
+    """Return the most recent active chat session for the current user, with messages."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter_by(user_id=user_id, status="active").order_by(
+        ChatSession.created_at.desc()
+    ).first()
+    if not session:
+        return jsonify({"session": None, "messages": []})
+    return jsonify({
+        "session": session.to_dict(),
+        "messages": [m.to_dict() for m in session.messages],
+    })
+
+
+@app.route("/api/customer/pending-feedback", methods=["GET"])
+@jwt_required()
+def customer_pending_feedback():
+    """Return resolved/escalated sessions that the user hasn't given feedback for."""
+    user_id = int(get_jwt_identity())
+    # Subquery: session IDs that already have feedback from this user
+    feedback_session_ids = db.session.query(Feedback.chat_session_id).filter(
+        Feedback.user_id == user_id,
+        Feedback.chat_session_id.isnot(None),
+    ).subquery()
+
+    sessions = ChatSession.query.filter(
+        ChatSession.user_id == user_id,
+        ChatSession.status.in_(["resolved", "escalated"]),
+        ~ChatSession.id.in_(feedback_session_ids),
+    ).order_by(ChatSession.created_at.desc()).all()
+
+    return jsonify({
+        "sessions": [s.to_dict() for s in sessions],
+    })
+
+
 @app.route("/api/customer/sessions", methods=["GET"])
 @jwt_required()
 def customer_sessions():
@@ -789,7 +906,7 @@ def list_feedback():
 def manager_dashboard():
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if user.role not in ("manager", "cto"):
+    if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
     total_chats = ChatSession.query.count()
@@ -842,7 +959,7 @@ def manager_dashboard():
 def manager_tickets():
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if user.role not in ("manager", "cto"):
+    if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
     status = request.args.get("status")
@@ -876,7 +993,7 @@ def manager_tickets():
 def update_ticket(ticket_id):
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if user.role not in ("manager", "cto"):
+    if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
     ticket = Ticket.query.get(ticket_id)
@@ -904,7 +1021,7 @@ def update_ticket(ticket_id):
 def manager_chats():
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if user.role not in ("manager", "cto"):
+    if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
     status = request.args.get("status")
@@ -921,7 +1038,7 @@ def manager_chats():
 def manager_users():
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if user.role not in ("manager", "cto"):
+    if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     managers = User.query.filter(User.role.in_(["manager"])).all()
     return jsonify({"managers": [u.to_dict() for u in managers]})
@@ -970,11 +1087,223 @@ def cto_overview():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INIT DB
+# ADMIN ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/dashboard", methods=["GET"])
+@jwt_required()
+def admin_dashboard():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    # User counts by role
+    user_counts = db.session.query(
+        User.role, db.func.count(User.id)
+    ).group_by(User.role).all()
+
+    total_users = sum(c[1] for c in user_counts)
+
+    # Chat stats
+    total_chats = ChatSession.query.count()
+    resolved_chats = ChatSession.query.filter_by(status="resolved").count()
+    escalated_chats = ChatSession.query.filter_by(status="escalated").count()
+    active_chats = ChatSession.query.filter_by(status="active").count()
+
+    # Ticket stats
+    total_tickets = Ticket.query.count()
+    pending_tickets = Ticket.query.filter_by(status="pending").count()
+    in_progress_tickets = Ticket.query.filter_by(status="in_progress").count()
+    resolved_tickets = Ticket.query.filter_by(status="resolved").count()
+    critical_tickets = Ticket.query.filter_by(priority="critical").count()
+    high_tickets = Ticket.query.filter_by(priority="high").count()
+
+    # Feedback
+    total_feedback = Feedback.query.count()
+    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+
+    # Resolution rate
+    resolution_rate = round((resolved_chats / max(total_chats, 1)) * 100, 1)
+
+    # Category breakdown
+    categories = db.session.query(
+        ChatSession.sector_name, db.func.count(ChatSession.id)
+    ).group_by(ChatSession.sector_name).all()
+
+    return jsonify({
+        "stats": {
+            "total_users": total_users,
+            "total_chats": total_chats,
+            "resolved_chats": resolved_chats,
+            "escalated_chats": escalated_chats,
+            "active_chats": active_chats,
+            "total_tickets": total_tickets,
+            "pending_tickets": pending_tickets,
+            "in_progress_tickets": in_progress_tickets,
+            "resolved_tickets": resolved_tickets,
+            "critical_tickets": critical_tickets,
+            "high_tickets": high_tickets,
+            "total_feedback": total_feedback,
+            "avg_rating": round(float(avg_rating), 1),
+            "resolution_rate": resolution_rate,
+        },
+        "user_breakdown": [{"role": r[0], "count": r[1]} for r in user_counts],
+        "category_breakdown": [{"name": c[0] or "Unknown", "count": c[1]} for c in categories],
+    })
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@jwt_required()
+def admin_list_users():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    role_filter = request.args.get("role")
+    search = request.args.get("search")
+
+    query = User.query
+    if role_filter:
+        query = query.filter_by(role=role_filter)
+    if search:
+        query = query.filter(
+            db.or_(
+                User.name.ilike(f"%{search}%"),
+                User.email.ilike(f"%{search}%"),
+            )
+        )
+
+    users = query.order_by(User.created_at.desc()).all()
+    return jsonify({"users": [u.to_dict() for u in users]})
+
+
+@app.route("/api/admin/users", methods=["POST"])
+@jwt_required()
+def admin_create_user():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    name = data.get("name", "").strip()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    role = data.get("role", "customer").lower()
+
+    if not name or not email or not password:
+        return jsonify({"error": "Name, email, and password are required"}), 400
+    if role not in ("customer", "manager", "cto", "admin"):
+        return jsonify({"error": "Invalid role"}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email already registered"}), 409
+
+    new_user = User(name=name, email=email, role=role)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({"user": new_user.to_dict()}), 201
+
+
+@app.route("/api/admin/users/<int:uid>", methods=["PUT"])
+@jwt_required()
+def admin_update_user(uid):
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    target = User.query.get(uid)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+
+    data = request.json
+    if "name" in data:
+        target.name = data["name"].strip()
+    if "email" in data:
+        new_email = data["email"].strip().lower()
+        existing = User.query.filter_by(email=new_email).first()
+        if existing and existing.id != uid:
+            return jsonify({"error": "Email already in use"}), 409
+        target.email = new_email
+    if "role" in data:
+        new_role = data["role"].lower()
+        if new_role not in ("customer", "manager", "cto", "admin"):
+            return jsonify({"error": "Invalid role"}), 400
+        if uid == user_id and new_role != "admin":
+            return jsonify({"error": "Cannot change your own role"}), 400
+        target.role = new_role
+    if "password" in data and data["password"]:
+        target.set_password(data["password"])
+
+    db.session.commit()
+    return jsonify({"user": target.to_dict()})
+
+
+@app.route("/api/admin/users/<int:uid>", methods=["DELETE"])
+@jwt_required()
+def admin_delete_user(uid):
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if uid == user_id:
+        return jsonify({"error": "Cannot delete your own account"}), 400
+
+    target = User.query.get(uid)
+    if not target:
+        return jsonify({"error": "User not found"}), 404
+
+    # Delete associated data
+    Feedback.query.filter_by(user_id=uid).delete()
+    ChatMessage.query.filter(
+        ChatMessage.session_id.in_(
+            db.session.query(ChatSession.id).filter_by(user_id=uid)
+        )
+    ).delete(synchronize_session=False)
+    Ticket.query.filter_by(user_id=uid).delete()
+    ChatSession.query.filter_by(user_id=uid).delete()
+    db.session.delete(target)
+    db.session.commit()
+    return jsonify({"message": "User deleted"})
+
+
+@app.route("/api/admin/feedback", methods=["GET"])
+@jwt_required()
+def admin_feedback():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    feedbacks = Feedback.query.order_by(Feedback.created_at.desc()).all()
+    result = []
+    for f in feedbacks:
+        fd = f.to_dict()
+        if f.chat_session:
+            fd["session_sector"] = f.chat_session.sector_name
+            fd["session_subprocess"] = f.chat_session.subprocess_name
+        result.append(fd)
+    return jsonify({"feedbacks": result})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INIT DB + SEED ADMIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with app.app_context():
     db.create_all()
+
+    # Seed default admin if none exists
+    if not User.query.filter_by(role="admin").first():
+        admin = User(name="Admin", email="didardeep.12@gmail.com", role="admin")
+        admin.set_password("admin123")
+        db.session.add(admin)
+        db.session.commit()
+        print(">>> Default admin created: didardeep.12@gmail.com / admin123")
 
 
 if __name__ == "__main__":

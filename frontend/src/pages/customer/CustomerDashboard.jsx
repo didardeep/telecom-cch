@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { apiGet } from '../../api';
+import { apiGet, apiPut } from '../../api';
 import { useAuth } from '../../AuthContext';
 
 export default function CustomerDashboard() {
@@ -9,12 +9,24 @@ export default function CustomerDashboard() {
   const { user } = useAuth();
   const navigate = useNavigate();
 
-  useEffect(() => {
+  const refreshDashboard = () => {
     apiGet('/api/customer/dashboard').then(d => {
       setData(d);
       setLoading(false);
     });
+  };
+
+  useEffect(() => {
+    refreshDashboard();
   }, []);
+
+  const handleClearChat = async (e, sessionId) => {
+    e.stopPropagation();
+    try {
+      await apiPut(`/api/chat/session/${sessionId}/resolve`, {});
+      refreshDashboard();
+    } catch {}
+  };
 
   if (loading) return <div className="page-loader"><div className="spinner" /></div>;
 
@@ -81,19 +93,43 @@ export default function CustomerDashboard() {
                   <th>Issue</th>
                   <th>Status</th>
                   <th>Date</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {sessions.map(s => (
-                  <tr key={s.id}>
+                  <tr key={s.id}
+                    style={s.status === 'active' ? { cursor: 'pointer', background: '#eff6ff' } : {}}
+                    onClick={() => s.status === 'active' && navigate(`/customer/chat?resume=${s.id}`)}
+                    title={s.status === 'active' ? 'Click to resume this chat' : ''}
+                  >
                     <td>#{s.id}</td>
                     <td>{s.sector_name || '—'}</td>
                     <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {s.query_text || '—'}
                     </td>
-                    <td><span className={`badge badge-${s.status}`}>{s.status}</span></td>
+                    <td>
+                      <span className={`badge badge-${s.status}`}>{s.status}</span>
+                      {s.status === 'active' && <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 6 }}>Resume</span>}
+                    </td>
                     <td style={{ fontSize: 12, color: '#94a3b8' }}>
                       {s.created_at ? new Date(s.created_at).toLocaleDateString() : '—'}
+                    </td>
+                    <td>
+                      {s.status === 'active' && (
+                        <button
+                          className="btn btn-sm"
+                          style={{
+                            padding: '4px 10px', fontSize: 11, background: '#fef2f2',
+                            color: '#dc2626', border: '1px solid #fecaca', borderRadius: 6,
+                            cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500,
+                          }}
+                          onClick={(e) => handleClearChat(e, s.id)}
+                          title="End this chat session"
+                        >
+                          Clear
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

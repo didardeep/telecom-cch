@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { apiPost, apiPut, getToken } from '../../api';
+import { useSearchParams } from 'react-router-dom';
+import { getToken, apiGet, apiPost } from '../../api';
+import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 
 const API_BASE = '';
@@ -23,6 +25,20 @@ function formatResolution(text) {
 }
 
 export default function ChatSupport() {
+  const { user } = useAuth();
+  const [searchParams] = useSearchParams();
+
+  // ── Init-phase state ──
+  const [initPhase, setInitPhase] = useState('loading'); // loading | feedback-gate | resume-prompt | chat
+  const [pendingFeedback, setPendingFeedback] = useState([]);
+  const [currentFbIdx, setCurrentFbIdx] = useState(0);
+  const [activeSessionData, setActiveSessionData] = useState(null);
+  const [activeSessionMsgs, setActiveSessionMsgs] = useState([]);
+  const [fbRating, setFbRating] = useState(0);
+  const [fbComment, setFbComment] = useState('');
+  const [fbSubmitting, setFbSubmitting] = useState(false);
+
+  // ── Chat state ──
   const [messages, setMessages] = useState([]);
   const [inputVisible, setInputVisible] = useState(false);
   const [inputPlaceholder, setInputPlaceholder] = useState('Describe your issue...');
@@ -41,6 +57,8 @@ export default function ChatSupport() {
     language: 'English',
     queryText: '',
     resolution: '',
+    attempt: 0,
+    previousSolutions: [],
   });
   const msgIdCounter = useRef(0);
 
@@ -102,7 +120,7 @@ export default function ChatSupport() {
     }
   }, []);
 
-  // ── Start Chat ──
+  // ── Start Chat (fresh) ──
   const startChat = useCallback(async () => {
     setMessages([]);
     setDisabledGroups(new Set());
@@ -110,22 +128,24 @@ export default function ChatSupport() {
       step: 'welcome', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
       queryText: '', resolution: '',
+      attempt: 0, previousSolutions: [],
     };
     sessionIdRef.current = null;
     hideInput();
+    setInitPhase('chat');
 
-    const welcomeGroupId = nextId();
+    const userName = user?.name || 'there';
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `<strong>Welcome to Customer Handling!</strong><br><br>` +
+        html: `<strong>Hi ${userName}!</strong> Welcome to Customer Handling.<br><br>` +
           `I'm here to help you resolve issues related to telecom services — mobile, broadband, DTH, landline, and enterprise solutions.<br><br>` +
           `<em>You can type in any language — I'll respond in your preferred language.</em><br><br>` +
           `Please select your <strong>telecom service category</strong> below:`,
       });
-      setTimeout(() => loadSectorMenu(welcomeGroupId), 400);
+      setTimeout(() => loadSectorMenu(), 400);
     }, 500);
-  }, [addMessage, hideInput, createSession]);
+  }, [addMessage, hideInput, user]);
 
   // ── Load Sector Menu ──
   const loadSectorMenu = useCallback(async () => {
@@ -165,28 +185,87 @@ export default function ChatSupport() {
     stateRef.current.step = 'subprocess';
   }, [addMessage, disableGroup, saveMessage]);
 
+  // ── Fetch a single solution step ──
+  const fetchSolution = useCallback(async (userQuery) => {
+    const st = stateRef.current;
+    st.attempt += 1;
+
+    if (!sessionIdRef.current) {
+      await createSession();
+    }
+
+    st.queryText = userQuery;
+    saveMessage('user', userQuery, {
+      query_text: userQuery,
+      sector_name: st.sectorName,
+      subprocess_name: st.subprocessName,
+    });
+
+    setIsTyping(true);
+    const resolveData = await chatApiCall('/api/resolve-step', {
+      sector_key: st.sectorKey,
+      subprocess_key: st.subprocessKey,
+      query: userQuery,
+      language: st.language,
+      previous_solutions: st.previousSolutions,
+      attempt: st.attempt,
+    });
+    setIsTyping(false);
+
+    if (resolveData.is_telecom === false) {
+      addMessage({ type: 'non-telecom-warning', html: formatResolution(resolveData.resolution) });
+      saveMessage('bot', resolveData.resolution);
+      addMessage({ type: 'bot', html: `Please describe a telecom-related issue so I can help you.` });
+      showInput('Describe your telecom issue...');
+      st.attempt -= 1;
+      return;
+    }
+
+    st.resolution = resolveData.resolution;
+    st.previousSolutions.push(resolveData.resolution);
+    saveMessage('bot', resolveData.resolution, {
+      resolution: resolveData.resolution,
+      language: st.language,
+    });
+
+    addMessage({
+      type: 'resolution',
+      html: formatResolution(resolveData.resolution),
+    });
+
+    setTimeout(() => {
+      addMessage({
+        type: 'bot',
+        html: `Did this solution resolve your issue? <em>(Attempt ${st.attempt} of 5)</em>`,
+      });
+      const satGroupId = nextId();
+      addMessage({ type: 'satisfaction', groupId: satGroupId });
+    }, 800);
+
+    st.step = 'feedback';
+  }, [addMessage, saveMessage, showInput, createSession]);
+
   // ── Select Subprocess ──
-  const selectSubprocess = useCallback((key, name, groupId) => {
+  const selectSubprocess = useCallback(async (key, name, groupId) => {
     disableGroup(groupId);
     stateRef.current.subprocessKey = key;
     stateRef.current.subprocessName = name;
+    stateRef.current.attempt = 0;
+    stateRef.current.previousSolutions = [];
 
     addMessage({ type: 'user', text: name });
     saveMessage('user', name, { subprocess_name: name });
 
-    const isOthers = name === 'Others' || name.includes('Other');
     addMessage({
       type: 'bot',
-      html: isOthers
-        ? `No problem! Please <strong>describe your issue</strong> in detail and I'll identify the right category and help you resolve it.`
-        : `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution steps.`,
+      html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
     });
 
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, showInput, saveMessage]);
+  }, [addMessage, disableGroup, saveMessage, showInput]);
 
-  // ── Send Message ──
+  // ── Send Message (user describes issue for next solution) ──
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
     if (!text) return;
@@ -194,67 +273,19 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text });
     setInputValue('');
     hideInput();
-    stateRef.current.queryText = text;
 
-    // Create session on first user message (deferred from startChat)
-    if (!sessionIdRef.current) {
-      await createSession();
+    if (stateRef.current.language === 'English') {
+      try {
+        const langData = await chatApiCall('/api/detect-language', { text });
+        stateRef.current.language = langData.language || 'English';
+      } catch {
+        stateRef.current.language = 'English';
+      }
+      addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
     }
 
-    saveMessage('user', text, {
-      query_text: text,
-      sector_name: stateRef.current.sectorName,
-      subprocess_name: stateRef.current.subprocessName,
-    });
-
-    setIsTyping(true);
-    try {
-      const langData = await chatApiCall('/api/detect-language', { text });
-      stateRef.current.language = langData.language || 'English';
-    } catch {
-      stateRef.current.language = 'English';
-    }
-
-    addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
-
-    const resolveData = await chatApiCall('/api/resolve', {
-      query: text,
-      sector_key: stateRef.current.sectorKey,
-      subprocess_key: stateRef.current.subprocessKey,
-      language: stateRef.current.language,
-    });
-    setIsTyping(false);
-
-    if (!resolveData.is_telecom) {
-      addMessage({ type: 'non-telecom-warning', html: formatResolution(resolveData.resolution) });
-      saveMessage('bot', resolveData.resolution);
-      setTimeout(() => {
-        addMessage({ type: 'bot', html: `Would you like to try again? Let me show the menu once more.` });
-        setTimeout(() => loadSectorMenu(), 400);
-      }, 1500);
-      return;
-    }
-
-    if (resolveData.identified_subprocess && stateRef.current.subprocessName?.includes('Other')) {
-      addMessage({ type: 'system', text: `Identified category: ${resolveData.identified_subprocess}` });
-    }
-
-    stateRef.current.resolution = resolveData.resolution;
-    saveMessage('bot', resolveData.resolution, {
-      resolution: resolveData.resolution,
-      language: stateRef.current.language,
-    });
-
-    addMessage({ type: 'resolution', html: formatResolution(resolveData.resolution) });
-
-    setTimeout(() => {
-      addMessage({ type: 'bot', html: `Were these steps helpful? Did they resolve your issue?` });
-      const satGroupId = nextId();
-      addMessage({ type: 'satisfaction', groupId: satGroupId });
-    }, 1000);
-
-    stateRef.current.step = 'feedback';
-  }, [inputValue, addMessage, hideInput, loadSectorMenu, saveMessage]);
+    await fetchSolution(text);
+  }, [inputValue, addMessage, hideInput, fetchSolution]);
 
   // ── Send Summary Email ──
   const handleSendEmail = useCallback(async (groupId) => {
@@ -285,7 +316,6 @@ export default function ChatSupport() {
     addMessage({ type: 'thankyou' });
     saveMessage('user', 'Yes, my issue is resolved');
 
-    // Mark session resolved on backend (generates summary)
     if (sessionIdRef.current) {
       try {
         const token = getToken();
@@ -304,44 +334,56 @@ export default function ChatSupport() {
     stateRef.current.step = 'resolved';
   }, [addMessage, disableGroup, saveMessage]);
 
-  // ── Unsatisfied → Auto-escalate ──
+  // ── Unsatisfied → Ask for query or escalate after 5 attempts ──
   const handleUnsatisfied = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'No, my issue is not resolved' });
     saveMessage('user', 'No, my issue is not resolved');
 
-    // Auto-escalate session and raise ticket
-    let refNum = '';
-    if (sessionIdRef.current) {
-      try {
-        const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        });
-        const data = await resp.json();
-        if (data.ticket) {
-          refNum = data.ticket.reference_number;
-        }
-      } catch {}
+    const st = stateRef.current;
+
+    if (st.attempt >= 5) {
+      let refNum = '';
+      if (sessionIdRef.current) {
+        try {
+          const token = getToken();
+          const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          });
+          const data = await resp.json();
+          if (data.ticket) {
+            refNum = data.ticket.reference_number;
+          }
+        } catch {}
+      }
+
+      addMessage({
+        type: 'bot',
+        html: `We've exhausted all available solutions. A support ticket has been raised and a customer support executive will contact you shortly.` +
+          (refNum ? `<br><br>Your reference number: <strong>${refNum}</strong><br>Please save this for future reference.` : ''),
+      });
+
+      setTimeout(() => {
+        const actionGroupId = nextId();
+        addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+      }, 1000);
+      st.step = 'escalated';
+    } else {
+      addMessage({
+        type: 'bot',
+        html: `I'm sorry that didn't help. Please <strong>describe your specific issue</strong> so I can provide a better solution.`,
+      });
+      showInput('Describe your issue in detail...');
+      st.step = 'query';
     }
-
-    addMessage({
-      type: 'bot',
-      html: `We're sorry we couldn't resolve your issue. A support ticket has been raised and a customer support executive will contact you shortly.` +
-        (refNum ? `<br><br>Your reference number: <strong>${refNum}</strong><br>Please save this for future reference.` : ''),
-    });
-
-    setTimeout(() => {
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-    }, 1000);
-    stateRef.current.step = 'escalated';
-  }, [addMessage, disableGroup, saveMessage]);
+  }, [addMessage, disableGroup, saveMessage, showInput]);
 
   // ── Back to Menu ──
   const handleBackToMenu = useCallback((groupId) => {
     disableGroup(groupId);
+    stateRef.current.attempt = 0;
+    stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: 'Main Menu' });
     addMessage({ type: 'bot', html: `Sure! Please select your <strong>telecom service category</strong>:` });
     setTimeout(() => loadSectorMenu(), 400);
@@ -354,7 +396,6 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text: 'Exit' });
     hideInput();
 
-    // Send chat summary email automatically on exit
     if (sessionIdRef.current) {
       addMessage({ type: 'system', text: 'Sending chat summary to your email...' });
       try {
@@ -395,7 +436,6 @@ export default function ChatSupport() {
     let refNum = 'TC-' + Date.now().toString(36).toUpperCase() + '-' +
       Math.random().toString(36).substring(2, 6).toUpperCase();
 
-    // Escalate session → creates ticket on backend
     if (sessionIdRef.current) {
       try {
         const token = getToken();
@@ -449,15 +489,221 @@ export default function ChatSupport() {
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   }, []);
 
-  // ── Init ──
+  // ═══════════════════════════════════════════════════════════════════════
+  //  RESUME CHAT — restore an active session
+  // ═══════════════════════════════════════════════════════════════════════
+  const resumeChat = useCallback(async (session, msgs) => {
+    setInitPhase('chat');
+    setMessages([]);
+    setDisabledGroups(new Set());
+    hideInput();
+
+    sessionIdRef.current = session.id;
+
+    // Restore stateRef from session metadata
+    stateRef.current.sectorName = session.sector_name || null;
+    stateRef.current.subprocessName = session.subprocess_name || null;
+    stateRef.current.language = session.language || 'English';
+    stateRef.current.queryText = session.query_text || '';
+    stateRef.current.resolution = session.resolution || '';
+
+    // Reverse-lookup sector key from menu
+    try {
+      const token = getToken();
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const menuResp = await fetch(`${API_BASE}/api/menu`, { headers });
+      const menuData = await menuResp.json();
+      for (const [key, sector] of Object.entries(menuData.menu)) {
+        if (sector.name === session.sector_name) {
+          stateRef.current.sectorKey = key;
+          break;
+        }
+      }
+
+      // Reverse-lookup subprocess key
+      if (stateRef.current.sectorKey && session.subprocess_name) {
+        const spData = await chatApiCall('/api/subprocesses', {
+          sector_key: stateRef.current.sectorKey,
+          language: 'English',
+        });
+        for (const [key, name] of Object.entries(spData.subprocesses)) {
+          if (name === session.subprocess_name) {
+            stateRef.current.subprocessKey = key;
+            break;
+          }
+        }
+      }
+    } catch {}
+
+    // Show "resuming" system message
+    const resumeMsg = { type: 'system', text: `Resuming your previous chat session #${session.id}` };
+    setMessages([{ ...resumeMsg, id: nextId(), groupId: nextId() }]);
+
+    // Render previous messages as history
+    const botResolutions = [];
+    const newMsgs = [];
+    for (const m of msgs) {
+      const id = nextId();
+      if (m.sender === 'user') {
+        newMsgs.push({ type: 'user', text: m.content, id, groupId: id });
+      } else if (m.sender === 'bot') {
+        if (m.content.length > 150) {
+          botResolutions.push(m.content);
+          newMsgs.push({ type: 'resolution', html: formatResolution(m.content), id, groupId: id });
+        } else {
+          newMsgs.push({ type: 'bot', html: formatResolution(m.content), id, groupId: id });
+        }
+      } else {
+        newMsgs.push({ type: 'system', text: m.content, id, groupId: id });
+      }
+    }
+
+    stateRef.current.previousSolutions = botResolutions;
+    stateRef.current.attempt = botResolutions.length;
+
+    setMessages(prev => [...prev, ...newMsgs]);
+    scrollToBottom();
+
+    // Determine current step and show appropriate interactive UI
+    setTimeout(async () => {
+      if (!session.sector_name) {
+        addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' });
+        loadSectorMenu();
+      } else if (!session.subprocess_name) {
+        addMessage({ type: 'bot', html: `Please select the <strong>type of issue</strong> you're facing with <strong>${session.sector_name}</strong>:` });
+        const data = await chatApiCall('/api/subprocesses', {
+          sector_key: stateRef.current.sectorKey,
+          language: stateRef.current.language,
+        });
+        const spGroupId = nextId();
+        addMessage({ type: 'subprocess-grid', subprocesses: data.subprocesses, groupId: spGroupId });
+        stateRef.current.step = 'subprocess';
+      } else if (session.resolution) {
+        addMessage({
+          type: 'bot',
+          html: `Did this solution resolve your issue? <em>(Attempt ${stateRef.current.attempt} of 5)</em>`,
+        });
+        const satGroupId = nextId();
+        addMessage({ type: 'satisfaction', groupId: satGroupId });
+        stateRef.current.step = 'feedback';
+      } else {
+        addMessage({
+          type: 'bot',
+          html: 'Please <strong>describe your specific issue</strong> so I can provide the best resolution.',
+        });
+        showInput('Describe your issue in any language...');
+        stateRef.current.step = 'query';
+      }
+    }, 400);
+  }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput]);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  FEEDBACK GATE — submit feedback for a pending session
+  // ═══════════════════════════════════════════════════════════════════════
+  const handleFeedbackSubmit = useCallback(async () => {
+    if (fbRating === 0) return;
+    const session = pendingFeedback[currentFbIdx];
+    if (!session) return;
+
+    setFbSubmitting(true);
+    await apiPost('/api/feedback', {
+      chat_session_id: session.id,
+      rating: fbRating,
+      comment: fbComment,
+    });
+    setFbSubmitting(false);
+    setFbRating(0);
+    setFbComment('');
+
+    // Move to next pending session or proceed
+    if (currentFbIdx + 1 < pendingFeedback.length) {
+      setCurrentFbIdx(prev => prev + 1);
+    } else {
+      // All feedback submitted — proceed to check active session
+      proceedAfterFeedback();
+    }
+  }, [fbRating, fbComment, pendingFeedback, currentFbIdx]);
+
+  const proceedAfterFeedback = useCallback(async () => {
+    const resumeId = searchParams.get('resume');
+
+    // Check for direct resume from URL param
+    if (resumeId) {
+      try {
+        const data = await apiGet(`/api/chat/session/${resumeId}`);
+        if (data?.session?.status === 'active') {
+          setActiveSessionData(data.session);
+          setActiveSessionMsgs(data.messages || []);
+          setInitPhase('resume-prompt');
+          return;
+        }
+      } catch {}
+    }
+
+    // Check for any active session
+    const activeData = await apiGet('/api/customer/active-session');
+    if (activeData?.session) {
+      setActiveSessionData(activeData.session);
+      setActiveSessionMsgs(activeData.messages || []);
+      setInitPhase('resume-prompt');
+      return;
+    }
+
+    // No active session → fresh chat
+    startChat();
+  }, [searchParams, startChat]);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  INITIALIZATION
+  // ═══════════════════════════════════════════════════════════════════════
   const initialized = useRef(false);
   useEffect(() => {
     if (initialized.current) return;
     initialized.current = true;
-    startChat();
+
+    (async () => {
+      // 1. Check pending feedback
+      try {
+        const fbData = await apiGet('/api/customer/pending-feedback');
+        if (fbData?.sessions?.length > 0) {
+          setPendingFeedback(fbData.sessions);
+          setCurrentFbIdx(0);
+          setInitPhase('feedback-gate');
+          return;
+        }
+      } catch {}
+
+      // 2. Check for resume from URL or active session
+      const resumeId = searchParams.get('resume');
+      if (resumeId) {
+        try {
+          const data = await apiGet(`/api/chat/session/${resumeId}`);
+          if (data?.session?.status === 'active') {
+            setActiveSessionData(data.session);
+            setActiveSessionMsgs(data.messages || []);
+            setInitPhase('resume-prompt');
+            return;
+          }
+        } catch {}
+      }
+
+      const activeData = await apiGet('/api/customer/active-session');
+      if (activeData?.session) {
+        setActiveSessionData(activeData.session);
+        setActiveSessionMsgs(activeData.messages || []);
+        setInitPhase('resume-prompt');
+        return;
+      }
+
+      // 3. No pending feedback, no active session → start fresh
+      startChat();
+    })();
   }, []);
 
-  // ── Render messages ──
+  // ═══════════════════════════════════════════════════════════════════════
+  //  RENDER — messages
+  // ═══════════════════════════════════════════════════════════════════════
   const renderMessage = (msg) => {
     const isDisabled = disabledGroups.has(msg.groupId);
 
@@ -607,37 +853,220 @@ export default function ChatSupport() {
     }
   };
 
+  // ═══════════════════════════════════════════════════════════════════════
+  //  RENDER — Feedback Gate Screen
+  // ═══════════════════════════════════════════════════════════════════════
+  const renderFeedbackGate = () => {
+    const session = pendingFeedback[currentFbIdx];
+    if (!session) return null;
+
+    return (
+      <div className="gate-overlay">
+        <div className="gate-card feedback-gate">
+          <div className="gate-icon">&#9733;</div>
+          <h2 className="gate-title">Feedback Required</h2>
+          <p className="gate-subtitle">
+            Please rate your previous chat session before starting a new one.
+            {pendingFeedback.length > 1 && (
+              <span className="gate-counter"> ({currentFbIdx + 1} of {pendingFeedback.length})</span>
+            )}
+          </p>
+
+          <div className="gate-session-info">
+            <div className="gate-session-row">
+              <span className="gate-label">Category</span>
+              <span className="gate-value">{session.sector_name || 'N/A'}</span>
+            </div>
+            <div className="gate-session-row">
+              <span className="gate-label">Issue</span>
+              <span className="gate-value">{session.subprocess_name || 'N/A'}</span>
+            </div>
+            <div className="gate-session-row">
+              <span className="gate-label">Status</span>
+              <span className={`badge badge-${session.status}`}>{session.status}</span>
+            </div>
+            <div className="gate-session-row">
+              <span className="gate-label">Date</span>
+              <span className="gate-value">
+                {session.created_at ? new Date(session.created_at).toLocaleDateString() : 'N/A'}
+              </span>
+            </div>
+            {session.summary && (
+              <div className="gate-summary">
+                <span className="gate-label">Summary</span>
+                <p>{session.summary}</p>
+              </div>
+            )}
+          </div>
+
+          <div className="gate-rating">
+            <label>Rate your experience</label>
+            <div className="gate-stars">
+              {[1, 2, 3, 4, 5].map(n => (
+                <button key={n} type="button"
+                  className={`gate-star${n <= fbRating ? ' active' : ''}`}
+                  onClick={() => setFbRating(n)}>
+                  &#9733;
+                </button>
+              ))}
+            </div>
+            <span className="gate-rating-label">
+              {fbRating === 0 ? 'Click a star to rate' : `${fbRating}/5`}
+            </span>
+          </div>
+
+          <div className="gate-comment">
+            <label>Comments (optional)</label>
+            <textarea
+              placeholder="Tell us about your experience..."
+              value={fbComment}
+              onChange={e => setFbComment(e.target.value)}
+              rows={3}
+            />
+          </div>
+
+          <button
+            className="gate-submit-btn"
+            disabled={fbRating === 0 || fbSubmitting}
+            onClick={handleFeedbackSubmit}
+          >
+            {fbSubmitting ? 'Submitting...' : 'Submit Feedback'}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  RENDER — Resume Prompt Screen
+  // ═══════════════════════════════════════════════════════════════════════
+  const renderResumePrompt = () => {
+    const session = activeSessionData;
+    if (!session) return null;
+
+    const lastMsg = activeSessionMsgs.length > 0
+      ? activeSessionMsgs[activeSessionMsgs.length - 1]
+      : null;
+
+    return (
+      <div className="gate-overlay">
+        <div className="gate-card resume-gate">
+          <div className="gate-icon">&#128172;</div>
+          <h2 className="gate-title">Active Chat Found</h2>
+          <p className="gate-subtitle">
+            You have an active chat session. Would you like to continue or start a new one?
+          </p>
+
+          <div className="gate-session-info">
+            <div className="gate-session-row">
+              <span className="gate-label">Session</span>
+              <span className="gate-value">#{session.id}</span>
+            </div>
+            {session.sector_name && (
+              <div className="gate-session-row">
+                <span className="gate-label">Category</span>
+                <span className="gate-value">{session.sector_name}</span>
+              </div>
+            )}
+            {session.subprocess_name && (
+              <div className="gate-session-row">
+                <span className="gate-label">Issue Type</span>
+                <span className="gate-value">{session.subprocess_name}</span>
+              </div>
+            )}
+            <div className="gate-session-row">
+              <span className="gate-label">Started</span>
+              <span className="gate-value">
+                {session.created_at ? new Date(session.created_at).toLocaleString() : 'N/A'}
+              </span>
+            </div>
+            {lastMsg && (
+              <div className="gate-summary">
+                <span className="gate-label">Last message</span>
+                <p>{lastMsg.content.length > 120 ? lastMsg.content.slice(0, 120) + '...' : lastMsg.content}</p>
+              </div>
+            )}
+          </div>
+
+          <div className="gate-actions">
+            <button
+              className="gate-btn gate-btn-primary"
+              onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}
+            >
+              Continue Chat
+            </button>
+            <button
+              className="gate-btn gate-btn-secondary"
+              onClick={() => startChat()}
+            >
+              Start New Chat
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  MAIN RENDER
+  // ═══════════════════════════════════════════════════════════════════════
   return (
     <div className="chat-support-page">
       <div className="app-container">
         <div className="header">
-          <div className="header-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '32px', width: 'auto' }} /></div>
+          <div className="header-icon" style={{ fontSize: 20, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
           <div className="header-info">
             <h1>Customer Handling</h1>
             <p>AI-powered multilingual support</p>
           </div>
           <div className="status-dot" />
-          <button className="restart-btn" onClick={startChat}>Restart</button>
-        </div>
-
-        <div className="chat-area" ref={chatAreaRef}>
-          {messages.map(renderMessage)}
-          {isTyping && (
-            <div className="typing-indicator visible">
-              <div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" />
-            </div>
+          {initPhase === 'chat' && (
+            <button className="restart-btn" onClick={startChat}>Restart</button>
           )}
         </div>
 
-        {inputVisible && (
-          <div className="input-area">
-            <div className="input-row">
-              <textarea ref={inputRef} value={inputValue} onChange={handleInputChange}
-                onKeyDown={handleKeyDown} placeholder={inputPlaceholder} rows={1} />
-              <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>Send</button>
+        {initPhase === 'loading' && (
+          <div className="chat-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div className="typing-indicator visible">
+              <div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" />
             </div>
-            <div className="input-hint">Press Enter to send &middot; Supports any language</div>
           </div>
+        )}
+
+        {initPhase === 'feedback-gate' && (
+          <div className="chat-area">
+            {renderFeedbackGate()}
+          </div>
+        )}
+
+        {initPhase === 'resume-prompt' && (
+          <div className="chat-area">
+            {renderResumePrompt()}
+          </div>
+        )}
+
+        {initPhase === 'chat' && (
+          <>
+            <div className="chat-area" ref={chatAreaRef}>
+              {messages.map(renderMessage)}
+              {isTyping && (
+                <div className="typing-indicator visible">
+                  <div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" />
+                </div>
+              )}
+            </div>
+
+            {inputVisible && (
+              <div className="input-area">
+                <div className="input-row">
+                  <textarea ref={inputRef} value={inputValue} onChange={handleInputChange}
+                    onKeyDown={handleKeyDown} placeholder={inputPlaceholder} rows={1} />
+                  <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>Send</button>
+                </div>
+                <div className="input-hint">Press Enter to send &middot; Supports any language</div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

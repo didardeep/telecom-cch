@@ -40,3 +40,7 @@ export async function apiPost(endpoint, body) {
 export async function apiPut(endpoint, body) {
   return apiCall(endpoint, { method: 'PUT', body: JSON.stringify(body) });
 }
+
+export async function apiDelete(endpoint) {
+  return apiCall(endpoint, { method: 'DELETE' });
+}
