@@ -20,7 +20,7 @@ from flask_mail import Mail, Message
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting
 
 load_dotenv()
 
@@ -52,9 +52,9 @@ mail = Mail(app)
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+    api_key="808cf0ccab8445b39c6d8767a7e2c433",
+    api_version="2023-07-01-preview",
+    azure_endpoint="https://entgptaiuat.openai.azure.com"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
@@ -925,6 +925,8 @@ def manager_dashboard():
 
     total_feedback = Feedback.query.count()
     avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     total_users = User.query.filter_by(role="customer").count()
 
@@ -948,6 +950,7 @@ def manager_dashboard():
             "high_tickets": high_tickets,
             "total_feedback": total_feedback,
             "avg_rating": round(float(avg_rating), 1),
+            "csat_score": csat_score,
             "total_customers": total_users,
         },
         "category_breakdown": [{"name": c[0] or "Unknown", "count": c[1]} for c in categories],
@@ -1087,6 +1090,30 @@ def cto_overview():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# EMPLOYEE ID GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ROLE_PREFIX = {
+    "manager": "MGR",
+    "human_agent": "HA",
+    "cto": "CTO",
+    "admin": "ADM",
+}
+
+
+def generate_employee_id(role):
+    prefix = ROLE_PREFIX.get(role)
+    if not prefix:
+        return None
+    existing = User.query.filter(User.employee_id.like(f"{prefix}%")).order_by(User.employee_id.desc()).first()
+    if existing and existing.employee_id:
+        num = int(existing.employee_id[len(prefix):]) + 1
+    else:
+        num = 1
+    return f"{prefix}{num:05d}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ADMIN ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1122,6 +1149,8 @@ def admin_dashboard():
     # Feedback
     total_feedback = Feedback.query.count()
     avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     # Resolution rate
     resolution_rate = round((resolved_chats / max(total_chats, 1)) * 100, 1)
@@ -1146,6 +1175,7 @@ def admin_dashboard():
             "high_tickets": high_tickets,
             "total_feedback": total_feedback,
             "avg_rating": round(float(avg_rating), 1),
+            "csat_score": csat_score,
             "resolution_rate": resolution_rate,
         },
         "user_breakdown": [{"role": r[0], "count": r[1]} for r in user_counts],
@@ -1195,16 +1225,99 @@ def admin_create_user():
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
-    if role not in ("customer", "manager", "cto", "admin"):
+    if role not in ("customer", "manager", "human_agent", "cto", "admin"):
         return jsonify({"error": "Invalid role"}), 400
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    new_user = User(name=name, email=email, role=role)
+    emp_id = generate_employee_id(role)
+    new_user = User(name=name, email=email, role=role, employee_id=emp_id)
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
     return jsonify({"user": new_user.to_dict()}), 201
+
+
+@app.route("/api/admin/users/upload", methods=["POST"])
+@jwt_required()
+def admin_upload_users():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    if not file.filename.endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Only Excel files (.xlsx, .xls) are allowed"}), 400
+
+    from openpyxl import load_workbook
+    import io
+
+    try:
+        wb = load_workbook(io.BytesIO(file.read()))
+        ws = wb.active
+    except Exception:
+        return jsonify({"error": "Could not read Excel file"}), 400
+
+    # Parse headers from first row
+    headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
+    required = {"name", "email", "role"}
+    header_set = set(headers)
+    if not required.issubset(header_set):
+        missing = required - header_set
+        return jsonify({"error": f"Missing required columns: {', '.join(missing)}. Required: Name, Email, Role"}), 400
+
+    col_map = {h: i for i, h in enumerate(headers)}
+    valid_roles = {"manager", "human_agent", "cto", "admin"}
+    created = 0
+    updated = 0
+    skipped = []
+
+    for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        name = str(row[col_map["name"]] or "").strip()
+        email = str(row[col_map["email"]] or "").strip().lower()
+        role = str(row[col_map["role"]] or "").strip().lower().replace(" ", "_")
+
+        if not name or not email:
+            skipped.append(f"Row {row_num}: missing name or email")
+            continue
+        if role not in valid_roles:
+            skipped.append(f"Row {row_num}: invalid role '{role}' for {email}")
+            continue
+
+        # Check for employee_id column
+        emp_id_from_excel = None
+        if "employee id" in col_map:
+            emp_id_from_excel = str(row[col_map["employee id"]] or "").strip() or None
+        elif "employee_id" in col_map:
+            emp_id_from_excel = str(row[col_map["employee_id"]] or "").strip() or None
+
+        existing = User.query.filter_by(email=email).first()
+        if existing:
+            existing.name = name
+            existing.role = role
+            if emp_id_from_excel:
+                existing.employee_id = emp_id_from_excel
+            elif not existing.employee_id:
+                existing.employee_id = generate_employee_id(role)
+            updated += 1
+        else:
+            emp_id = emp_id_from_excel or generate_employee_id(role)
+            new_user = User(name=name, email=email, role=role, employee_id=emp_id)
+            new_user.set_password("Welcome@123")
+            db.session.add(new_user)
+            created += 1
+
+    db.session.commit()
+    return jsonify({
+        "message": f"Upload complete: {created} created, {updated} updated",
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+    })
 
 
 @app.route("/api/admin/users/<int:uid>", methods=["PUT"])
@@ -1230,11 +1343,15 @@ def admin_update_user(uid):
         target.email = new_email
     if "role" in data:
         new_role = data["role"].lower()
-        if new_role not in ("customer", "manager", "cto", "admin"):
+        if new_role not in ("customer", "manager", "human_agent", "cto", "admin"):
             return jsonify({"error": "Invalid role"}), 400
         if uid == user_id and new_role != "admin":
             return jsonify({"error": "Cannot change your own role"}), 400
         target.role = new_role
+        if new_role == "customer":
+            target.employee_id = None
+        else:
+            target.employee_id = generate_employee_id(new_role)
     if "password" in data and data["password"]:
         target.set_password(data["password"])
 
@@ -1291,6 +1408,567 @@ def admin_feedback():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# REPORTS & ANALYTICS ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SLA_DEFAULTS = {
+    "sla_critical": {"value": "4", "description": "SLA target hours for Critical priority"},
+    "sla_high": {"value": "12", "description": "SLA target hours for High priority"},
+    "sla_medium": {"value": "48", "description": "SLA target hours for Medium priority"},
+    "sla_low": {"value": "120", "description": "SLA target hours for Low priority"},
+}
+
+
+def get_sla_targets():
+    targets = {}
+    for key in ["sla_critical", "sla_high", "sla_medium", "sla_low"]:
+        setting = SystemSetting.query.filter_by(key=key).first()
+        priority = key.replace("sla_", "")
+        targets[priority] = float(setting.value) if setting else float(SLA_DEFAULTS[key]["value"])
+    return targets
+
+
+def get_date_range(range_param):
+    now = datetime.now(timezone.utc)
+    if range_param == "7d":
+        return now - timedelta(days=7)
+    elif range_param == "90d":
+        return now - timedelta(days=90)
+    elif range_param == "12m":
+        return now - timedelta(days=365)
+    else:
+        return now - timedelta(days=30)
+
+
+def get_previous_period(range_param):
+    now = datetime.now(timezone.utc)
+    if range_param == "7d":
+        return now - timedelta(days=14), now - timedelta(days=7)
+    elif range_param == "90d":
+        return now - timedelta(days=180), now - timedelta(days=90)
+    elif range_param == "12m":
+        return now - timedelta(days=730), now - timedelta(days=365)
+    else:
+        return now - timedelta(days=60), now - timedelta(days=30)
+
+
+def calc_trend(current, previous):
+    if previous == 0:
+        return 100.0 if current > 0 else 0.0
+    return round(((current - previous) / previous) * 100, 1)
+
+
+@app.route("/api/reports/overview", methods=["GET"])
+@jwt_required()
+def reports_overview():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    range_param = request.args.get("range", "30d")
+    start_date = get_date_range(range_param)
+    prev_start, prev_end = get_previous_period(range_param)
+
+    # Current period tickets
+    current_tickets = Ticket.query.filter(Ticket.created_at >= start_date)
+    resolved_current = current_tickets.filter(Ticket.status == "resolved").count()
+
+    # Previous period
+    prev_tickets = Ticket.query.filter(Ticket.created_at >= prev_start, Ticket.created_at < prev_end)
+    resolved_prev = prev_tickets.filter(Ticket.status == "resolved").count()
+
+    # Avg resolution time (current period)
+    resolved_with_time = Ticket.query.filter(
+        Ticket.created_at >= start_date,
+        Ticket.status == "resolved",
+        Ticket.resolved_at.isnot(None)
+    ).all()
+    if resolved_with_time:
+        total_hours = sum(
+            (t.resolved_at - t.created_at).total_seconds() / 3600
+            for t in resolved_with_time
+        )
+        avg_resolution = round(total_hours / len(resolved_with_time), 1)
+    else:
+        avg_resolution = 0
+
+    # Previous avg resolution
+    prev_resolved_with_time = Ticket.query.filter(
+        Ticket.created_at >= prev_start, Ticket.created_at < prev_end,
+        Ticket.status == "resolved", Ticket.resolved_at.isnot(None)
+    ).all()
+    if prev_resolved_with_time:
+        prev_total_hours = sum(
+            (t.resolved_at - t.created_at).total_seconds() / 3600
+            for t in prev_resolved_with_time
+        )
+        prev_avg_resolution = round(prev_total_hours / len(prev_resolved_with_time), 1)
+    else:
+        prev_avg_resolution = 0
+
+    # CSAT
+    current_feedback = Feedback.query.filter(Feedback.created_at >= start_date)
+    total_fb = current_feedback.count()
+    satisfied = current_feedback.filter(Feedback.rating >= 4).count()
+    csat = round((satisfied / max(total_fb, 1)) * 100, 1)
+
+    prev_feedback = Feedback.query.filter(Feedback.created_at >= prev_start, Feedback.created_at < prev_end)
+    prev_total_fb = prev_feedback.count()
+    prev_satisfied = prev_feedback.filter(Feedback.rating >= 4).count()
+    prev_csat = round((prev_satisfied / max(prev_total_fb, 1)) * 100, 1)
+
+    # SLA compliance
+    sla_targets = get_sla_targets()
+    all_resolved = Ticket.query.filter(
+        Ticket.created_at >= start_date,
+        Ticket.status == "resolved",
+        Ticket.resolved_at.isnot(None)
+    ).all()
+    within_sla = 0
+    for t in all_resolved:
+        hours = (t.resolved_at - t.created_at).total_seconds() / 3600
+        target = sla_targets.get(t.priority, 48)
+        if hours <= target:
+            within_sla += 1
+    sla_compliance = round((within_sla / max(len(all_resolved), 1)) * 100, 1)
+
+    prev_all_resolved = Ticket.query.filter(
+        Ticket.created_at >= prev_start, Ticket.created_at < prev_end,
+        Ticket.status == "resolved", Ticket.resolved_at.isnot(None)
+    ).all()
+    prev_within_sla = 0
+    for t in prev_all_resolved:
+        hours = (t.resolved_at - t.created_at).total_seconds() / 3600
+        target = sla_targets.get(t.priority, 48)
+        if hours <= target:
+            prev_within_sla += 1
+    prev_sla = round((prev_within_sla / max(len(prev_all_resolved), 1)) * 100, 1)
+
+    # Resolution trends (monthly)
+    resolution_trends = db.session.query(
+        db.func.date_trunc("month", Ticket.resolved_at).label("month"),
+        db.func.avg(
+            db.func.extract("epoch", Ticket.resolved_at - Ticket.created_at) / 3600
+        ).label("avg_hours"),
+        db.func.count(Ticket.id).label("volume")
+    ).filter(
+        Ticket.resolved_at.isnot(None),
+        Ticket.created_at >= start_date
+    ).group_by("month").order_by("month").all()
+
+    # Weekly volume
+    weekly_volume = db.session.query(
+        db.func.extract("dow", Ticket.created_at).label("dow"),
+        db.func.count(Ticket.id).label("opened")
+    ).filter(Ticket.created_at >= start_date).group_by("dow").order_by("dow").all()
+
+    weekly_resolved = db.session.query(
+        db.func.extract("dow", Ticket.resolved_at).label("dow"),
+        db.func.count(Ticket.id).label("resolved")
+    ).filter(
+        Ticket.resolved_at.isnot(None),
+        Ticket.resolved_at >= start_date
+    ).group_by("dow").order_by("dow").all()
+
+    day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    opened_map = {int(r[0]): r[1] for r in weekly_volume}
+    resolved_map = {int(r[0]): r[1] for r in weekly_resolved}
+    weekly_data = [
+        {"day": day_names[i], "opened": opened_map.get(i, 0), "resolved": resolved_map.get(i, 0)}
+        for i in range(7)
+    ]
+
+    # Category breakdown
+    categories = db.session.query(
+        Ticket.category, db.func.count(Ticket.id)
+    ).filter(Ticket.created_at >= start_date).group_by(Ticket.category).all()
+
+    # Priority distribution
+    priorities = db.session.query(
+        Ticket.priority, db.func.count(Ticket.id)
+    ).filter(Ticket.created_at >= start_date).group_by(Ticket.priority).all()
+
+    return jsonify({
+        "total_resolved": resolved_current,
+        "resolved_trend": calc_trend(resolved_current, resolved_prev),
+        "avg_resolution_hours": avg_resolution,
+        "resolution_trend": calc_trend(avg_resolution, prev_avg_resolution),
+        "csat_score": csat,
+        "csat_trend": calc_trend(csat, prev_csat),
+        "sla_compliance": sla_compliance,
+        "sla_trend": calc_trend(sla_compliance, prev_sla),
+        "resolution_trends": [
+            {
+                "month": r[0].strftime("%b %Y") if r[0] else "",
+                "avg_hours": round(float(r[1] or 0), 1),
+                "volume": r[2]
+            } for r in resolution_trends
+        ],
+        "weekly_volume": weekly_data,
+        "category_breakdown": [{"name": c[0] or "Other", "count": c[1]} for c in categories],
+        "priority_distribution": [{"priority": p[0], "count": p[1]} for p in priorities],
+    })
+
+
+@app.route("/api/reports/agents", methods=["GET"])
+@jwt_required()
+def reports_agents():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    range_param = request.args.get("range", "30d")
+    start_date = get_date_range(range_param)
+
+    managers = User.query.filter(User.role.in_(["manager"])).all()
+    agents_data = []
+
+    for mgr in managers:
+        assigned = Ticket.query.filter(
+            Ticket.assigned_to == mgr.id,
+            Ticket.created_at >= start_date
+        )
+        resolved = assigned.filter(Ticket.status == "resolved").count()
+        pending = assigned.filter(Ticket.status.in_(["pending", "in_progress"])).count()
+        escalated = assigned.filter(Ticket.status == "escalated").count()
+
+        resolved_tickets = Ticket.query.filter(
+            Ticket.assigned_to == mgr.id,
+            Ticket.status == "resolved",
+            Ticket.resolved_at.isnot(None),
+            Ticket.created_at >= start_date
+        ).all()
+
+        if resolved_tickets:
+            avg_time = round(sum(
+                (t.resolved_at - t.created_at).total_seconds() / 3600
+                for t in resolved_tickets
+            ) / len(resolved_tickets), 1)
+        else:
+            avg_time = 0
+
+        agent_feedback = db.session.query(db.func.avg(Feedback.rating)).join(
+            Ticket, Feedback.chat_session_id == Ticket.chat_session_id
+        ).filter(
+            Ticket.assigned_to == mgr.id,
+            Feedback.rating > 0,
+            Feedback.created_at >= start_date
+        ).scalar()
+
+        agents_data.append({
+            "id": mgr.id,
+            "name": mgr.name,
+            "resolved": resolved,
+            "pending": pending,
+            "escalated": escalated,
+            "avg_resolution_hours": avg_time,
+            "avg_rating": round(float(agent_feedback or 0), 1),
+        })
+
+    top_performer = max(agents_data, key=lambda x: x["resolved"], default=None)
+    fastest = min(
+        [a for a in agents_data if a["avg_resolution_hours"] > 0],
+        key=lambda x: x["avg_resolution_hours"], default=None
+    )
+    highest_rated = max(
+        [a for a in agents_data if a["avg_rating"] > 0],
+        key=lambda x: x["avg_rating"], default=None
+    )
+
+    return jsonify({
+        "agents": agents_data,
+        "total_agents": len(managers),
+        "top_performer": {"name": top_performer["name"], "resolved": top_performer["resolved"]} if top_performer else None,
+        "fastest_agent": {"name": fastest["name"], "hours": fastest["avg_resolution_hours"]} if fastest else None,
+        "highest_rated": {"name": highest_rated["name"], "rating": highest_rated["avg_rating"]} if highest_rated else None,
+    })
+
+
+@app.route("/api/reports/csat", methods=["GET"])
+@jwt_required()
+def reports_csat():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    range_param = request.args.get("range", "30d")
+    start_date = get_date_range(range_param)
+    prev_start, prev_end = get_previous_period(range_param)
+
+    # Current CSAT
+    current_fb = Feedback.query.filter(Feedback.created_at >= start_date)
+    total_responses = current_fb.count()
+    satisfied = current_fb.filter(Feedback.rating >= 4).count()
+    csat = round((satisfied / max(total_responses, 1)) * 100, 1)
+
+    prev_fb = Feedback.query.filter(Feedback.created_at >= prev_start, Feedback.created_at < prev_end)
+    prev_total = prev_fb.count()
+    prev_satisfied = prev_fb.filter(Feedback.rating >= 4).count()
+    prev_csat = round((prev_satisfied / max(prev_total, 1)) * 100, 1)
+
+    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(
+        Feedback.created_at >= start_date, Feedback.rating > 0
+    ).scalar() or 0
+
+    # Response rate
+    resolved_tickets = Ticket.query.filter(
+        Ticket.created_at >= start_date, Ticket.status == "resolved"
+    ).count()
+    response_rate = round((total_responses / max(resolved_tickets, 1)) * 100, 1)
+
+    # Monthly CSAT trend
+    monthly_csat = db.session.query(
+        db.func.date_trunc("month", Feedback.created_at).label("month"),
+        db.func.count(Feedback.id).label("total"),
+        db.func.count(db.case((Feedback.rating >= 4, 1))).label("satisfied")
+    ).filter(Feedback.created_at >= start_date).group_by("month").order_by("month").all()
+
+    # Feedback distribution (1-5 stars)
+    distribution = db.session.query(
+        Feedback.rating, db.func.count(Feedback.id)
+    ).filter(
+        Feedback.created_at >= start_date, Feedback.rating > 0
+    ).group_by(Feedback.rating).order_by(Feedback.rating).all()
+
+    dist_map = {r[0]: r[1] for r in distribution}
+    feedback_dist = [{"stars": i, "count": dist_map.get(i, 0)} for i in range(1, 6)]
+
+    # Response volume trend
+    volume_trend = db.session.query(
+        db.func.date_trunc("month", Feedback.created_at).label("month"),
+        db.func.count(Feedback.id).label("count")
+    ).filter(Feedback.created_at >= start_date).group_by("month").order_by("month").all()
+
+    return jsonify({
+        "current_csat": csat,
+        "csat_trend": calc_trend(csat, prev_csat),
+        "total_responses": total_responses,
+        "responses_trend": calc_trend(total_responses, prev_total),
+        "avg_rating": round(float(avg_rating), 1),
+        "response_rate": min(response_rate, 100),
+        "csat_monthly": [
+            {
+                "month": m[0].strftime("%b %Y") if m[0] else "",
+                "csat": round((m[2] / max(m[1], 1)) * 100, 1)
+            } for m in monthly_csat
+        ],
+        "feedback_distribution": feedback_dist,
+        "response_volume": [
+            {"month": v[0].strftime("%b %Y") if v[0] else "", "count": v[1]}
+            for v in volume_trend
+        ],
+    })
+
+
+@app.route("/api/reports/sla", methods=["GET"])
+@jwt_required()
+def reports_sla():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    range_param = request.args.get("range", "30d")
+    start_date = get_date_range(range_param)
+    prev_start, prev_end = get_previous_period(range_param)
+    sla_targets = get_sla_targets()
+
+    resolved = Ticket.query.filter(
+        Ticket.created_at >= start_date,
+        Ticket.status == "resolved",
+        Ticket.resolved_at.isnot(None)
+    ).all()
+
+    within = 0
+    near_breach = 0
+    breached = 0
+    first_response_times = []
+
+    priority_stats = {}
+    for p in ["critical", "high", "medium", "low"]:
+        priority_stats[p] = {"target": sla_targets.get(p, 48), "times": [], "within": 0, "breached": 0}
+
+    for t in resolved:
+        hours = (t.resolved_at - t.created_at).total_seconds() / 3600
+        target = sla_targets.get(t.priority, 48)
+        first_response_times.append(hours)
+
+        if t.priority in priority_stats:
+            priority_stats[t.priority]["times"].append(hours)
+            if hours <= target:
+                priority_stats[t.priority]["within"] += 1
+            else:
+                priority_stats[t.priority]["breached"] += 1
+
+        if hours <= target:
+            within += 1
+        elif hours <= target * 1.0 and hours > target * 0.8:
+            near_breach += 1
+        else:
+            pct = hours / target if target > 0 else 999
+            if pct > 1.0:
+                breached += 1
+            elif pct > 0.8:
+                near_breach += 1
+            else:
+                within += 1
+
+    total = max(len(resolved), 1)
+    compliance_pct = round((within / total) * 100, 1)
+    near_pct = round((near_breach / total) * 100, 1)
+    breached_pct = round((breached / total) * 100, 1)
+    avg_first_response = round(sum(first_response_times) / max(len(first_response_times), 1), 1)
+
+    # Previous period compliance
+    prev_resolved = Ticket.query.filter(
+        Ticket.created_at >= prev_start, Ticket.created_at < prev_end,
+        Ticket.status == "resolved", Ticket.resolved_at.isnot(None)
+    ).all()
+    prev_within = 0
+    for t in prev_resolved:
+        hours = (t.resolved_at - t.created_at).total_seconds() / 3600
+        target = sla_targets.get(t.priority, 48)
+        if hours <= target:
+            prev_within += 1
+    prev_compliance = round((prev_within / max(len(prev_resolved), 1)) * 100, 1)
+
+    # SLA targets with actual averages
+    sla_target_list = []
+    for p in ["critical", "high", "medium", "low"]:
+        ps = priority_stats[p]
+        avg_actual = round(sum(ps["times"]) / max(len(ps["times"]), 1), 1) if ps["times"] else 0
+        sla_target_list.append({
+            "priority": p,
+            "target_hours": ps["target"],
+            "actual_hours": avg_actual,
+            "status": "within" if avg_actual <= ps["target"] else "breached",
+            "total": len(ps["times"]),
+        })
+
+    # Monthly breach trend
+    monthly_trend = db.session.query(
+        db.func.date_trunc("month", Ticket.resolved_at).label("month"),
+        Ticket.priority,
+        Ticket.resolved_at,
+        Ticket.created_at
+    ).filter(
+        Ticket.resolved_at.isnot(None),
+        Ticket.created_at >= start_date
+    ).all()
+
+    month_data = {}
+    for t in monthly_trend:
+        month_key = t[0].strftime("%b %Y") if t[0] else "Unknown"
+        if month_key not in month_data:
+            month_data[month_key] = {"compliant": 0, "near_breach": 0, "breached": 0, "total": 0}
+        hours = (t[2] - t[3]).total_seconds() / 3600
+        target = sla_targets.get(t[1], 48)
+        month_data[month_key]["total"] += 1
+        pct_of_target = hours / target if target > 0 else 999
+        if pct_of_target <= 0.8:
+            month_data[month_key]["compliant"] += 1
+        elif pct_of_target <= 1.0:
+            month_data[month_key]["near_breach"] += 1
+        else:
+            month_data[month_key]["breached"] += 1
+
+    breach_trend = []
+    for month_key, data in sorted(month_data.items()):
+        t = max(data["total"], 1)
+        breach_trend.append({
+            "month": month_key,
+            "compliant": round((data["compliant"] / t) * 100, 1),
+            "near_breach": round((data["near_breach"] / t) * 100, 1),
+            "breached": round((data["breached"] / t) * 100, 1),
+        })
+
+    return jsonify({
+        "compliance_percentage": compliance_pct,
+        "compliance_trend": calc_trend(compliance_pct, prev_compliance),
+        "near_breach_percentage": near_pct,
+        "breached_percentage": breached_pct,
+        "avg_first_response": avg_first_response,
+        "sla_targets": sla_target_list,
+        "breach_trend": breach_trend,
+        "within_count": within,
+        "near_breach_count": near_breach,
+        "breached_count": breached,
+    })
+
+
+@app.route("/api/reports/export", methods=["GET"])
+@jwt_required()
+def reports_export():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    fmt = request.args.get("format", "csv")
+    section = request.args.get("section", "overview")
+    range_param = request.args.get("range", "30d")
+    start_date = get_date_range(range_param)
+
+    if fmt == "csv":
+        import io
+        import csv
+        from flask import Response
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        if section == "overview":
+            tickets = Ticket.query.filter(Ticket.created_at >= start_date).all()
+            writer.writerow(["Reference", "Category", "Priority", "Status", "Created", "Resolved", "Resolution Hours"])
+            for t in tickets:
+                hours = ""
+                if t.resolved_at and t.created_at:
+                    hours = round((t.resolved_at - t.created_at).total_seconds() / 3600, 1)
+                writer.writerow([t.reference_number, t.category, t.priority, t.status,
+                                t.created_at.isoformat() if t.created_at else "",
+                                t.resolved_at.isoformat() if t.resolved_at else "", hours])
+
+        elif section == "agents":
+            managers = User.query.filter(User.role.in_(["manager"])).all()
+            writer.writerow(["Agent", "Resolved", "Pending", "Escalated", "Avg Hours", "Rating"])
+            for mgr in managers:
+                assigned = Ticket.query.filter(Ticket.assigned_to == mgr.id, Ticket.created_at >= start_date)
+                resolved = assigned.filter(Ticket.status == "resolved").count()
+                pending = assigned.filter(Ticket.status.in_(["pending", "in_progress"])).count()
+                escalated = assigned.filter(Ticket.status == "escalated").count()
+                writer.writerow([mgr.name, resolved, pending, escalated, 0, 0])
+
+        elif section == "csat":
+            feedbacks = Feedback.query.filter(Feedback.created_at >= start_date).all()
+            writer.writerow(["User", "Rating", "Comment", "Date"])
+            for f in feedbacks:
+                writer.writerow([f.user.name if f.user else "", f.rating, f.comment,
+                                f.created_at.isoformat() if f.created_at else ""])
+
+        elif section == "sla":
+            tickets = Ticket.query.filter(
+                Ticket.created_at >= start_date, Ticket.status == "resolved",
+                Ticket.resolved_at.isnot(None)
+            ).all()
+            sla_targets = get_sla_targets()
+            writer.writerow(["Reference", "Priority", "Target Hours", "Actual Hours", "Status"])
+            for t in tickets:
+                hours = round((t.resolved_at - t.created_at).total_seconds() / 3600, 1)
+                target = sla_targets.get(t.priority, 48)
+                status = "Within SLA" if hours <= target else "Breached"
+                writer.writerow([t.reference_number, t.priority, target, hours, status])
+
+        response = Response(output.getvalue(), mimetype="text/csv")
+        response.headers["Content-Disposition"] = f"attachment; filename=report_{section}_{range_param}.csv"
+        return response
+
+    return jsonify({"error": "PDF export is handled client-side"}), 400
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # INIT DB + SEED ADMIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1299,11 +1977,29 @@ with app.app_context():
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
-        admin = User(name="Admin", email="didardeep.12@gmail.com", role="admin")
+        admin = User(name="Admin", email="didardeep.12@gmail.com", role="admin", employee_id="ADM00001")
         admin.set_password("admin123")
         db.session.add(admin)
         db.session.commit()
         print(">>> Default admin created: didardeep.12@gmail.com / admin123")
+
+    # Backfill employee_ids for existing non-customer users
+    users_without_emp_id = User.query.filter(
+        User.role != "customer",
+        User.employee_id.is_(None)
+    ).all()
+    for u in users_without_emp_id:
+        u.employee_id = generate_employee_id(u.role)
+    if users_without_emp_id:
+        db.session.commit()
+        print(f">>> Backfilled employee_ids for {len(users_without_emp_id)} users")
+
+    # Seed SLA defaults if not present
+    for key, info in SLA_DEFAULTS.items():
+        if not SystemSetting.query.filter_by(key=key).first():
+            setting = SystemSetting(key=key, value=info["value"], category="sla", description=info["description"])
+            db.session.add(setting)
+    db.session.commit()
 
 
 if __name__ == "__main__":

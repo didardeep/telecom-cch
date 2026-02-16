@@ -31,44 +31,50 @@ export default function AdminDashboard() {
 
       <div className="stats-grid">
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon primary">👥</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon primary"></div></div>
           <div className="stat-card-label">Total Users</div>
           <div className="stat-card-value">{s.total_users || 0}</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon success">💬</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon success"></div></div>
           <div className="stat-card-label">Total Chats</div>
           <div className="stat-card-value">{s.total_chats || 0}</div>
           <div className="stat-card-sub">{s.active_chats || 0} active now</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon warning">🎫</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon warning"></div></div>
           <div className="stat-card-label">Total Tickets</div>
           <div className="stat-card-value">{s.total_tickets || 0}</div>
           <div className="stat-card-sub">{s.pending_tickets || 0} pending</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon danger">🚨</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon danger"></div></div>
           <div className="stat-card-label">Critical / High</div>
           <div className="stat-card-value">{s.critical_tickets || 0} / {s.high_tickets || 0}</div>
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 20 }}>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon success">✅</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon success"></div></div>
           <div className="stat-card-label">Resolution Rate</div>
           <div className="stat-card-value">{s.resolution_rate || 0}%</div>
           <div className="stat-card-sub">{s.resolved_chats || 0} resolved</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon warning">⭐</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon primary"></div></div>
+          <div className="stat-card-label">CSAT Score</div>
+          <div className="stat-card-value">{s.csat_score || 0}%</div>
+          <div className="stat-card-sub">{s.total_feedback || 0} responses</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-card-header"><div className="stat-card-icon warning"></div></div>
           <div className="stat-card-label">Avg Rating</div>
           <div className="stat-card-value">{s.avg_rating || 0}/5</div>
           <div className="stat-card-sub">{s.total_feedback || 0} feedbacks</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon danger">🔺</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon danger"></div></div>
           <div className="stat-card-label">Escalated</div>
           <div className="stat-card-value">{s.escalated_chats || 0}</div>
         </div>

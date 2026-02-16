@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { apiGet, apiPost, apiPut, apiDelete } from '../../api';
+import { useState, useEffect, useRef } from 'react';
+import { apiGet, apiPost, apiPut, apiDelete, getToken } from '../../api';
 
 export default function UserManagement() {
   const [users, setUsers] = useState([]);
@@ -7,13 +7,16 @@ export default function UserManagement() {
   const [roleFilter, setRoleFilter] = useState('');
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
-  const [addForm, setAddForm] = useState({ name: '', email: '', password: '', role: 'customer' });
+  const [addForm, setAddForm] = useState({ name: '', email: '', password: '', role: 'human_agent' });
   const [addError, setAddError] = useState('');
   const [addLoading, setAddLoading] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [editData, setEditData] = useState({});
   const [editError, setEditError] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const fileInputRef = useRef(null);
 
   const loadUsers = () => {
     const params = new URLSearchParams();
@@ -42,7 +45,7 @@ export default function UserManagement() {
         setAddError(res.error);
       } else {
         setShowAdd(false);
-        setAddForm({ name: '', email: '', password: '', role: 'customer' });
+        setAddForm({ name: '', email: '', password: '', role: 'human_agent' });
         loadUsers();
       }
     } catch {
@@ -75,6 +78,38 @@ export default function UserManagement() {
     }
   };
 
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setUploadLoading(true);
+    setUploadResult(null);
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const token = getToken();
+      const resp = await fetch('/api/admin/users/upload', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      const data = await resp.json();
+      if (data.error) {
+        setUploadResult({ type: 'error', message: data.error });
+      } else {
+        setUploadResult({
+          type: 'success',
+          message: data.message,
+          skipped: data.skipped || [],
+        });
+        loadUsers();
+      }
+    } catch {
+      setUploadResult({ type: 'error', message: 'Upload failed' });
+    }
+    setUploadLoading(false);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
   const handleDelete = async (id) => {
     try {
       const data = await apiDelete(`/api/admin/users/${id}`);
@@ -104,8 +139,8 @@ export default function UserManagement() {
           <div className="table-filters">
             <select className="filter-select" value={roleFilter} onChange={e => setRoleFilter(e.target.value)}>
               <option value="">All Roles</option>
-              <option value="customer">Customer</option>
               <option value="manager">Manager</option>
+              <option value="human_agent">Human Agent</option>
               <option value="cto">CTO</option>
               <option value="admin">Admin</option>
             </select>
@@ -117,8 +152,40 @@ export default function UserManagement() {
             <button className="btn btn-primary btn-sm" onClick={() => { setShowAdd(!showAdd); setAddError(''); }}>
               {showAdd ? 'Cancel' : '+ Add User'}
             </button>
+            <input type="file" ref={fileInputRef} accept=".xlsx,.xls" onChange={handleUpload} style={{ display: 'none' }} />
+            <button className="btn btn-outline btn-sm" disabled={uploadLoading} onClick={() => fileInputRef.current?.click()}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 4 }}>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              {uploadLoading ? 'Uploading...' : 'Upload Excel'}
+            </button>
           </div>
         </div>
+
+        {uploadResult && (
+          <div style={{
+            background: uploadResult.type === 'success' ? '#ecfdf5' : '#fef2f2',
+            border: `1px solid ${uploadResult.type === 'success' ? '#a7f3d0' : '#fecaca'}`,
+            borderRadius: 8, padding: '12px 16px', marginBottom: 16, fontSize: 13,
+            color: uploadResult.type === 'success' ? '#047857' : '#dc2626',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontWeight: 600 }}>{uploadResult.message}</span>
+              <button onClick={() => setUploadResult(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'inherit' }}>x</button>
+            </div>
+            {uploadResult.skipped?.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 12, color: '#b45309' }}>
+                <strong>Skipped rows:</strong>
+                {uploadResult.skipped.map((s, i) => <div key={i}>{s}</div>)}
+              </div>
+            )}
+            {uploadResult.type === 'success' && (
+              <div style={{ marginTop: 6, fontSize: 11, color: '#64748b' }}>
+                Default password for new users: <strong>Welcome@123</strong>
+              </div>
+            )}
+          </div>
+        )}
 
         {showAdd && (
           <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: 20, margin: '0 0 16px' }}>
@@ -144,8 +211,8 @@ export default function UserManagement() {
                 <label style={{ fontSize: 12, fontWeight: 600 }}>Role</label>
                 <select className="form-input" value={addForm.role}
                   onChange={e => setAddForm(f => ({ ...f, role: e.target.value }))}>
-                  <option value="customer">Customer</option>
                   <option value="manager">Manager</option>
+                  <option value="human_agent">Human Agent</option>
                   <option value="cto">CTO</option>
                   <option value="admin">Admin</option>
                 </select>
@@ -171,7 +238,7 @@ export default function UserManagement() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>ID</th>
+                  <th>Employee ID</th>
                   <th>Name</th>
                   <th>Email</th>
                   <th>Role</th>
@@ -182,7 +249,7 @@ export default function UserManagement() {
               <tbody>
                 {users.map(u => (
                   <tr key={u.id}>
-                    <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#64748b' }}>#{u.id}</td>
+                    <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#64748b', fontWeight: 600 }}>{u.employee_id || '—'}</td>
                     <td>
                       {editingId === u.id ? (
                         <input type="text" className="form-input" style={{ padding: '4px 8px', fontSize: 13 }}
@@ -203,15 +270,15 @@ export default function UserManagement() {
                       {editingId === u.id ? (
                         <select className="filter-select" value={editData.role}
                           onChange={e => setEditData(d => ({ ...d, role: e.target.value }))}>
-                          <option value="customer">Customer</option>
                           <option value="manager">Manager</option>
+                          <option value="human_agent">Human Agent</option>
                           <option value="cto">CTO</option>
                           <option value="admin">Admin</option>
                         </select>
                       ) : (
-                        <span className={`badge badge-${u.role === 'admin' ? 'escalated' : u.role === 'manager' ? 'active' : u.role === 'cto' ? 'in_progress' : 'resolved'}`}
+                        <span className={`badge badge-${u.role === 'admin' ? 'escalated' : u.role === 'manager' ? 'active' : u.role === 'cto' ? 'in_progress' : u.role === 'human_agent' ? 'pending' : 'resolved'}`}
                           style={{ textTransform: 'capitalize' }}>
-                          {u.role}
+                          {u.role === 'human_agent' ? 'Human Agent' : u.role}
                         </span>
                       )}
                     </td>

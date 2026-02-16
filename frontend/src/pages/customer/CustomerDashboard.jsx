@@ -43,28 +43,28 @@ export default function CustomerDashboard() {
       <div className="stats-grid">
         <div className="stat-card">
           <div className="stat-card-header">
-            <div className="stat-card-icon primary">💬</div>
+            <div className="stat-card-icon primary"></div>
           </div>
           <div className="stat-card-label">Total Chats</div>
           <div className="stat-card-value">{stats.total_chats || 0}</div>
         </div>
         <div className="stat-card">
           <div className="stat-card-header">
-            <div className="stat-card-icon success">✅</div>
+            <div className="stat-card-icon success"></div>
           </div>
           <div className="stat-card-label">Resolved</div>
           <div className="stat-card-value">{stats.resolved || 0}</div>
         </div>
         <div className="stat-card">
           <div className="stat-card-header">
-            <div className="stat-card-icon warning">🎫</div>
+            <div className="stat-card-icon warning"></div>
           </div>
           <div className="stat-card-label">Pending Tickets</div>
           <div className="stat-card-value">{stats.pending_tickets || 0}</div>
         </div>
         <div className="stat-card">
           <div className="stat-card-header">
-            <div className="stat-card-icon danger">🔺</div>
+            <div className="stat-card-icon danger"></div>
           </div>
           <div className="stat-card-label">Escalated</div>
           <div className="stat-card-value">{stats.escalated || 0}</div>
