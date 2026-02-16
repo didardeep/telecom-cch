@@ -7,7 +7,6 @@ export default function RegisterPage() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [role, setRole] = useState('customer');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -19,14 +18,12 @@ export default function RegisterPage() {
     setLoading(true);
 
     try {
-      const data = await apiPost('/api/auth/register', { name, email, password, role });
+      const data = await apiPost('/api/auth/register', { name, email, password });
       if (data.error) {
         setError(data.error);
       } else {
         login(data.token, data.user);
-        if (role === 'customer') navigate('/customer/dashboard');
-        else if (role === 'manager') navigate('/manager/dashboard');
-        else navigate('/cto/dashboard');
+        navigate('/customer/dashboard');
       }
     } catch {
       setError('Something went wrong. Please try again.');
@@ -38,9 +35,9 @@ export default function RegisterPage() {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-header">
-          <div className="auth-logo"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '48px', width: 'auto' }} /></div>
+          <div className="auth-logo" style={{ fontSize: 32, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
           <h2>Create Account</h2>
-          <p>Create your account</p>
+          <p>Register as a customer to get started</p>
         </div>
 
         {error && <div className="form-error">{error}</div>}
@@ -79,18 +76,6 @@ export default function RegisterPage() {
               minLength={6}
               required
             />
-          </div>
-          <div className="form-group">
-            <label>Role</label>
-            <select
-              className="form-select"
-              value={role}
-              onChange={e => setRole(e.target.value)}
-            >
-              <option value="customer">Customer</option>
-              <option value="manager">Manager</option>
-              <option value="cto">CTO</option>
-            </select>
           </div>
           <button
             type="submit"

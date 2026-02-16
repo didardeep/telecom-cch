@@ -15,6 +15,11 @@ import IssueTracking from './pages/manager/IssueTracking';
 import ChatDetail from './pages/manager/ChatDetail';
 import CTOLayout from './pages/cto/CTOLayout';
 import CTODashboard from './pages/cto/CTODashboard';
+import AdminLayout from './pages/admin/AdminLayout';
+import AdminDashboard from './pages/admin/AdminDashboard';
+import UserManagement from './pages/admin/UserManagement';
+import AdminFeedback from './pages/admin/AdminFeedback';
+import ReportsPage from './pages/admin/ReportsPage';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -32,6 +37,7 @@ export default function App() {
     if (user.role === 'customer') return '/customer/dashboard';
     if (user.role === 'manager') return '/manager/dashboard';
     if (user.role === 'cto') return '/cto/dashboard';
+    if (user.role === 'admin') return '/admin/dashboard';
     return '/login';
   };
 
@@ -55,6 +61,7 @@ export default function App() {
         <Route path="tickets" element={<ActiveTickets />} />
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
+        <Route path="reports" element={<ReportsPage />} />
       </Route>
 
       {/* CTO Routes */}
@@ -63,6 +70,17 @@ export default function App() {
         <Route path="tickets" element={<ActiveTickets />} />
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
+      </Route>
+
+      {/* Admin Routes */}
+      <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminLayout /></ProtectedRoute>}>
+        <Route path="dashboard" element={<AdminDashboard />} />
+        <Route path="users" element={<UserManagement />} />
+        <Route path="tickets" element={<ActiveTickets />} />
+        <Route path="tracking" element={<IssueTracking />} />
+        <Route path="chat-detail/:id" element={<ChatDetail />} />
+        <Route path="feedback" element={<AdminFeedback />} />
+        <Route path="reports" element={<ReportsPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" />} />

@@ -38,24 +38,24 @@ export default function CTODashboard() {
       {/* Top-level KPIs */}
       <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon success">📈</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon success"></div></div>
           <div className="stat-card-label">Resolution Rate</div>
           <div className="stat-card-value">{resRate}%</div>
           <div className="stat-card-sub">of all sessions</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon warning">⭐</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon warning"></div></div>
           <div className="stat-card-label">Avg Customer Rating</div>
           <div className="stat-card-value">{avgRating}/5</div>
           <div className="stat-card-sub">{s.total_feedback || 0} feedbacks</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon primary">👥</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon primary"></div></div>
           <div className="stat-card-label">Total Customers</div>
           <div className="stat-card-value">{data?.total_customers || 0}</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-header"><div className="stat-card-icon primary">💬</div></div>
+          <div className="stat-card-header"><div className="stat-card-icon primary"></div></div>
           <div className="stat-card-label">Total Sessions</div>
           <div className="stat-card-value">{data?.total_sessions || 0}</div>
         </div>
@@ -141,10 +141,10 @@ export default function CTODashboard() {
         <div className="section-card-body">
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
             {[
-              { label: 'Total Chats', val: s.total_chats || 0, icon: '💬' },
-              { label: 'Resolved Chats', val: s.resolved_chats || 0, icon: '✅' },
-              { label: 'Escalated Chats', val: s.escalated_chats || 0, icon: '🔺' },
-              { label: 'Active Now', val: s.active_chats || 0, icon: '🟢' },
+              { label: 'Total Chats', val: s.total_chats || 0, icon: '' },
+              { label: 'Resolved Chats', val: s.resolved_chats || 0, icon: '' },
+              { label: 'Escalated Chats', val: s.escalated_chats || 0, icon: '' },
+              { label: 'Active Now', val: s.active_chats || 0, icon: '' },
             ].map((item, i) => (
               <div key={i} style={{ textAlign: 'center', padding: 16, background: '#f8fafc', borderRadius: 10, border: '1px solid #e2e8f0' }}>
                 <div style={{ fontSize: 24, marginBottom: 6 }}>{item.icon}</div>

@@ -9,6 +9,7 @@ export default function HomePage() {
     if (user) {
       if (user.role === 'customer') navigate('/customer/dashboard');
       else if (user.role === 'manager') navigate('/manager/dashboard');
+      else if (user.role === 'admin') navigate('/admin/dashboard');
       else navigate('/cto/dashboard');
     } else {
       navigate('/login');
@@ -19,11 +20,11 @@ export default function HomePage() {
     <div className="home-page">
       <nav className="home-nav">
         <div className="home-logo">
-          <div className="home-logo-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '36px', width: 'auto' }} /></div>
+          <div className="home-logo-icon" style={{ fontSize: 28, fontWeight: 800, color: '#ffffff' }}>TeleBot</div>
           Customer Handling
         </div>
         <div className="home-nav-actions">
-          <button className="btn btn-outline btn-sm" onClick={() => navigate('/login')}>Login</button>
+          <button className="btn btn-outline btn-sm" style={{ color: '#ffffff', borderColor: 'rgba(255,255,255,0.5)' }} onClick={() => navigate('/login')}>Login</button>
           <button className="btn btn-primary btn-sm" onClick={() => navigate('/register')}>Register</button>
         </div>
       </nav>
@@ -40,25 +41,38 @@ export default function HomePage() {
           </h1>
 
           <p>
-            An intelligent customer complaint handling platform built for the telecom industry.
-            Powered by AI, it provides instant resolution steps for common issues across mobile, broadband,
-            DTH, landline, and enterprise services. Our multilingual chatbot understands your problem semantically
-            and guides you through step-by-step troubleshooting — all in your preferred language. Unresolved
-            issues are automatically escalated with full context to human support agents for faster resolution.
+            AI-powered complaint handling for telecom. Get instant resolutions, multilingual chat support,
+            and automatic escalation to human agents when needed.
           </p>
 
           <div className="home-features">
-            <div className="home-feature">
-              Multilingual AI Chat
+            <div className="home-feature-card">
+              <div className="home-feature-icon-box">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              </div>
+              <h4>Multilingual AI Chat</h4>
+              <p>Chat in your preferred language with semantic understanding</p>
             </div>
-            <div className="home-feature">
-              Auto Ticket Escalation
+            <div className="home-feature-card">
+              <div className="home-feature-icon-box">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              </div>
+              <h4>Auto Escalation</h4>
+              <p>Unresolved issues are escalated with full context automatically</p>
             </div>
-            <div className="home-feature">
-              Manager Dashboard
+            <div className="home-feature-card">
+              <div className="home-feature-icon-box">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+              </div>
+              <h4>Manager Dashboard</h4>
+              <p>Track tickets, monitor chats, and manage your team</p>
             </div>
-            <div className="home-feature">
-              Instant Resolutions
+            <div className="home-feature-card">
+              <div className="home-feature-icon-box">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              </div>
+              <h4>Instant Resolutions</h4>
+              <p>Step-by-step troubleshooting for common telecom issues</p>
             </div>
           </div>
 

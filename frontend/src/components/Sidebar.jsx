@@ -15,10 +15,10 @@ export default function Sidebar({ links }) {
     <aside className="sidebar">
       <div className="sidebar-header">
         <div className="sidebar-brand" onClick={() => navigate('/')} style={{ cursor: 'pointer' }}>
-          <div className="sidebar-logo"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '32px', width: 'auto' }} /></div>
+          <div className="sidebar-logo" style={{ fontSize: 22, fontWeight: 800, color: '#ffffff' }}>TeleBot</div>
           <div className="sidebar-brand-text">
             <h3>Customer Handling</h3>
-            <span>{user?.role} Portal</span>
+            <span>{user?.role === 'human_agent' ? 'Human Agent' : user?.role} Portal</span>
           </div>
         </div>
       </div>
@@ -44,7 +44,7 @@ export default function Sidebar({ links }) {
           </div>
           <div className="sidebar-user-info">
             <div className="sidebar-user-name">{user?.name}</div>
-            <div className="sidebar-user-role">{user?.role}</div>
+            <div className="sidebar-user-role">{user?.employee_id || (user?.role === 'human_agent' ? 'Human Agent' : user?.role)}</div>
           </div>
           <button className="sidebar-logout" onClick={handleLogout} title="Logout">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

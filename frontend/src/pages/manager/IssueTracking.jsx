@@ -8,7 +8,7 @@ export default function IssueTracking() {
   const [statusFilter, setStatusFilter] = useState('');
   const navigate = useNavigate();
 
-  const basePath = window.location.pathname.startsWith('/cto') ? '/cto' : '/manager';
+  const basePath = window.location.pathname.startsWith('/cto') ? '/cto' : window.location.pathname.startsWith('/admin') ? '/admin' : '/manager';
 
   useEffect(() => {
     const params = statusFilter ? `?status=${statusFilter}` : '';

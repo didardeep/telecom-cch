@@ -25,6 +25,7 @@ export default function LoginPage() {
         const role = data.user.role;
         if (role === 'customer') navigate('/customer/dashboard');
         else if (role === 'manager') navigate('/manager/dashboard');
+        else if (role === 'admin') navigate('/admin/dashboard');
         else navigate('/cto/dashboard');
       }
     } catch {
@@ -37,7 +38,7 @@ export default function LoginPage() {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-header">
-          <div className="auth-logo"><img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: '48px', width: 'auto' }} /></div>
+          <div className="auth-logo" style={{ fontSize: 32, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
           <h2>Welcome Back</h2>
           <p>Sign in to your account</p>
         </div>

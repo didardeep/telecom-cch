@@ -17,7 +17,8 @@ class User(db.Model):
     name = db.Column(db.String(120), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
-    role = db.Column(db.String(20), nullable=False, default="customer")  # customer, manager, cto
+    role = db.Column(db.String(20), nullable=False, default="customer")  # customer, manager, human_agent, cto, admin
+    employee_id = db.Column(db.String(20), unique=True, nullable=True)  # e.g. MGR00001, HA00001, CTO00001, ADM00001
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     chat_sessions = db.relationship("ChatSession", backref="user", lazy=True)
@@ -36,6 +37,7 @@ class User(db.Model):
             "name": self.name,
             "email": self.email,
             "role": self.role,
+            "employee_id": self.employee_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -133,6 +135,28 @@ class Ticket(db.Model):
             "resolution_notes": self.resolution_notes,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
+class SystemSetting(db.Model):
+    __tablename__ = "system_settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.String(500), nullable=False)
+    category = db.Column(db.String(50), default="general")
+    description = db.Column(db.Text, default="")
+    updated_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "key": self.key,
+            "value": self.value,
+            "category": self.category,
+            "description": self.description,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
