@@ -24,6 +24,13 @@ function formatResolution(text) {
     .replace(/\n/g, '<br>');
 }
 
+function limitSubprocesses(subprocesses) {
+  const entries = Object.entries(subprocesses);
+  const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
+  const major = entries.filter(([, v]) => v !== 'Others' && !v.toLowerCase().includes('other'));
+  return Object.fromEntries([...major.slice(0, 5), ...others]);
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const [searchParams] = useSearchParams();
@@ -125,7 +132,7 @@ export default function ChatSupport() {
     setMessages([]);
     setDisabledGroups(new Set());
     stateRef.current = {
-      step: 'welcome', sectorKey: null, sectorName: null,
+      step: 'greeting', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
       queryText: '', resolution: '',
       attempt: 0, previousSolutions: [],
@@ -134,18 +141,15 @@ export default function ChatSupport() {
     hideInput();
     setInitPhase('chat');
 
-    const userName = user?.name || 'there';
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `<strong>Hi ${userName}!</strong> Welcome to Customer Handling.<br><br>` +
-          `I'm here to help you resolve issues related to telecom services — mobile, broadband, DTH, landline, and enterprise solutions.<br><br>` +
-          `<em>You can type in any language — I'll respond in your preferred language.</em><br><br>` +
-          `Please select your <strong>telecom service category</strong> below:`,
+        html: `<strong>Welcome to TeleBot Support!</strong><br><br>` +
+          `We're delighted to have you here. Please say hello to get started — we'd love to hear from you!`,
       });
-      setTimeout(() => loadSectorMenu(), 400);
+      showInput('Type your greeting here...');
     }, 500);
-  }, [addMessage, hideInput, user]);
+  }, [addMessage, hideInput, showInput]);
 
   // ── Load Sector Menu ──
   const loadSectorMenu = useCallback(async () => {
@@ -181,7 +185,7 @@ export default function ChatSupport() {
     });
 
     const spGroupId = nextId();
-    addMessage({ type: 'subprocess-grid', subprocesses: data.subprocesses, groupId: spGroupId });
+    addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
     stateRef.current.step = 'subprocess';
   }, [addMessage, disableGroup, saveMessage]);
 
@@ -236,10 +240,10 @@ export default function ChatSupport() {
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `Did this solution resolve your issue? <em>(Attempt ${st.attempt} of 5)</em>`,
+        html: `Did this solution resolve your issue? <em>(Attempt ${st.attempt})</em>`,
       });
       const satGroupId = nextId();
-      addMessage({ type: 'satisfaction', groupId: satGroupId });
+      addMessage({ type: 'satisfaction', groupId: satGroupId, attempt: st.attempt });
     }, 800);
 
     st.step = 'feedback';
@@ -274,6 +278,49 @@ export default function ChatSupport() {
     setInputValue('');
     hideInput();
 
+    // ── Greeting step: semantically verify it's a greeting, then respond ──
+    if (stateRef.current.step === 'greeting') {
+      setIsTyping(true);
+      let isGreeting = true;
+      try {
+        const greetData = await chatApiCall('/api/detect-greeting', { text });
+        isGreeting = greetData.is_greeting !== false;
+      } catch {
+        isGreeting = true; // fail-open
+      }
+      setIsTyping(false);
+
+      if (!isGreeting) {
+        addMessage({
+          type: 'bot',
+          html: `That doesn't look like a greeting. Please say hello to get started — we'd love to hear from you! 😊`,
+        });
+        showInput('Type your greeting here...');
+        return;
+      }
+
+      const userName = user?.name || 'there';
+      setIsTyping(true);
+      await new Promise(resolve => setTimeout(resolve, 700));
+      setIsTyping(false);
+      addMessage({
+        type: 'bot',
+        html: `<strong>Hello, ${userName}!</strong><br><br>` +
+          `What a lovely greeting — thank you so much for reaching out! It's wonderful to have you here.<br><br>` +
+          `I'm your AI-powered telecom support assistant, ready to help you with any issues related to mobile, broadband, DTH, landline, and enterprise services.<br><br>` +
+          `<em>Feel free to type in any language — I'll respond in your preferred language.</em>`,
+      });
+      setTimeout(() => {
+        addMessage({
+          type: 'bot',
+          html: `<strong>How can I help you today?</strong><br>Please select your telecom service category below:`,
+        });
+        setTimeout(() => loadSectorMenu(), 400);
+      }, 1000);
+      stateRef.current.step = 'sector';
+      return;
+    }
+
     if (stateRef.current.language === 'English') {
       try {
         const langData = await chatApiCall('/api/detect-language', { text });
@@ -285,7 +332,7 @@ export default function ChatSupport() {
     }
 
     await fetchSolution(text);
-  }, [inputValue, addMessage, hideInput, fetchSolution]);
+  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user]);
 
   // ── Send Summary Email ──
   const handleSendEmail = useCallback(async (groupId) => {
@@ -334,50 +381,54 @@ export default function ChatSupport() {
     stateRef.current.step = 'resolved';
   }, [addMessage, disableGroup, saveMessage]);
 
-  // ── Unsatisfied → Ask for query or escalate after 5 attempts ──
+  // ── Unsatisfied → Ask for more details ──
   const handleUnsatisfied = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'No, my issue is not resolved' });
     saveMessage('user', 'No, my issue is not resolved');
 
-    const st = stateRef.current;
-
-    if (st.attempt >= 5) {
-      let refNum = '';
-      if (sessionIdRef.current) {
-        try {
-          const token = getToken();
-          const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          });
-          const data = await resp.json();
-          if (data.ticket) {
-            refNum = data.ticket.reference_number;
-          }
-        } catch {}
-      }
-
-      addMessage({
-        type: 'bot',
-        html: `We've exhausted all available solutions. A support ticket has been raised and a customer support executive will contact you shortly.` +
-          (refNum ? `<br><br>Your reference number: <strong>${refNum}</strong><br>Please save this for future reference.` : ''),
-      });
-
-      setTimeout(() => {
-        const actionGroupId = nextId();
-        addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-      }, 1000);
-      st.step = 'escalated';
-    } else {
-      addMessage({
-        type: 'bot',
-        html: `I'm sorry that didn't help. Please <strong>describe your specific issue</strong> so I can provide a better solution.`,
-      });
-      showInput('Describe your issue in detail...');
-      st.step = 'query';
-    }
+    addMessage({
+      type: 'bot',
+      html: `I'm sorry that didn't help. Please <strong>describe your specific issue</strong> so I can provide a better solution.`,
+    });
+    showInput('Describe your issue in detail...');
+    stateRef.current.step = 'query';
   }, [addMessage, disableGroup, saveMessage, showInput]);
+
+  // ── Raise Ticket (user-initiated from attempt 2 onwards) ──
+  const handleRaiseTicket = useCallback(async (groupId) => {
+    disableGroup(groupId);
+    addMessage({ type: 'user', text: 'Raise a ticket' });
+    saveMessage('user', 'Raise a ticket');
+
+    let refNum = '';
+    if (sessionIdRef.current) {
+      try {
+        const token = getToken();
+        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        });
+        const data = await resp.json();
+        if (data.ticket) {
+          refNum = data.ticket.reference_number;
+        }
+      } catch {}
+    }
+
+    addMessage({
+      type: 'bot',
+      html: `Your ticket has been raised successfully!` +
+        (refNum ? `<br><br>Reference number: <strong>${refNum}</strong>` : '') +
+        `<br><br>Our executive will review your issue and contact you shortly. You can also track your ticket status from the dashboard.`,
+    });
+
+    setTimeout(() => {
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+    }, 1000);
+    stateRef.current.step = 'escalated';
+  }, [addMessage, disableGroup, saveMessage]);
 
   // ── Back to Menu ──
   const handleBackToMenu = useCallback((groupId) => {
@@ -577,7 +628,7 @@ export default function ChatSupport() {
           language: stateRef.current.language,
         });
         const spGroupId = nextId();
-        addMessage({ type: 'subprocess-grid', subprocesses: data.subprocesses, groupId: spGroupId });
+        addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
         stateRef.current.step = 'subprocess';
       } else if (session.resolution) {
         addMessage({
@@ -732,13 +783,18 @@ export default function ChatSupport() {
       case 'subprocess-grid':
         return (
           <div key={msg.id} className="subprocess-grid">
-            {Object.entries(msg.subprocesses).map(([sk, sname]) => (
-              <button key={sk}
-                className={`subprocess-chip${sname === 'Others' || sname.includes('Other') ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
-                onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
-                {sname}
-              </button>
-            ))}
+            {Object.entries(msg.subprocesses).map(([sk, sname], idx) => {
+              const isOthers = sname === 'Others' || sname.toLowerCase().includes('other');
+              return (
+                <button key={sk}
+                  className={`subprocess-chip${isOthers ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
+                  onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
+                  <div className="chip-num">{isOthers ? '···' : idx + 1}</div>
+                  <div className="chip-label">{sname}</div>
+                  <div className="chip-arrow">›</div>
+                </button>
+              );
+            })}
           </div>
         );
 
@@ -759,7 +815,11 @@ export default function ChatSupport() {
             <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
               onClick={() => !isDisabled && handleSatisfied(msg.groupId)}>Yes, Resolved</button>
             <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleUnsatisfied(msg.groupId)}>No, Not Resolved</button>
+              onClick={() => !isDisabled && handleUnsatisfied(msg.groupId)}>No, Try Again</button>
+            {(msg.attempt || 0) >= 2 && (
+              <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
+                onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
+            )}
           </div>
         );
 

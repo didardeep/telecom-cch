@@ -23,7 +23,7 @@ export default function UserManagement() {
     if (roleFilter) params.append('role', roleFilter);
     if (search) params.append('search', search);
     apiGet(`/api/admin/users?${params.toString()}`).then(d => {
-      setUsers(d?.users || []);
+      setUsers((d?.users || []).filter(u => u.role !== 'customer'));
       setLoading(false);
     });
   };
