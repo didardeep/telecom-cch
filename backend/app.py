@@ -592,6 +592,39 @@ def add_chat_message(session_id):
 
     db.session.commit()
     return jsonify({"message": msg.to_dict()})
+# ═══════════════════════════════════════════════════════════════════
+# ADD THIS NEW ROUTE to app.py
+# Place it right after the add_chat_message route
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/chat/session/<int:session_id>/location", methods=["POST"])
+@jwt_required()
+def save_session_location(session_id):
+    """Save customer's GPS location for network signal complaints."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+
+    if latitude is None or longitude is None:
+        return jsonify({"error": "Latitude and longitude are required"}), 400
+
+    session.latitude = float(latitude)
+    session.longitude = float(longitude)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Location saved successfully",
+        "latitude": session.latitude,
+        "longitude": session.longitude,
+    }), 200
 
 
 @app.route("/api/chat/session/<int:session_id>/resolve", methods=["PUT"])

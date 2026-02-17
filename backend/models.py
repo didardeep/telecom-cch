@@ -57,6 +57,10 @@ class ChatSession(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     resolved_at = db.Column(db.DateTime, nullable=True)
 
+    # ── Location fields (captured for Network/Signal issues) ──
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
+
     messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
     ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
 
@@ -75,7 +79,8 @@ class ChatSession(db.Model):
             "summary": self.summary,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
-            "ticket_id": self.ticket.id if self.ticket else None,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
         }
 
 
