@@ -21,7 +21,8 @@ from openai import AzureOpenAI
 from dotenv import load_dotenv
 
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting
-
+# Add this import after other imports
+from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -403,14 +404,20 @@ def register():
     data = request.json
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
+    phone_number = data.get("phone_number", "").strip()  # ← NEW
     password = data.get("password", "")
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
+
+    # ← NEW: Validate phone number
+    if not phone_number:
+        return jsonify({"error": "Phone number is required"}), 400
+
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    user = User(name=name, email=email, role="customer")
+    user = User(name=name, email=email, phone_number=phone_number, role="customer")  # ← UPDATED
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -630,6 +637,7 @@ def save_session_location(session_id):
 @app.route("/api/chat/session/<int:session_id>/resolve", methods=["PUT"])
 @jwt_required()
 def resolve_session(session_id):
+    user_id = int(get_jwt_identity())
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -638,13 +646,26 @@ def resolve_session(session_id):
     session.resolved_at = datetime.now(timezone.utc)
     db.session.commit()
 
-    # Generate summary after commit so resolve is never blocked
+    # Generate summary
     try:
         msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
         session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
         db.session.commit()
     except Exception:
         pass
+
+    # ← NEW: Send WhatsApp message
+    try:
+        user = User.query.get(user_id)
+        if user and user.phone_number:
+            whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                print(f"✅ WhatsApp sent to {user.phone_number}: {result['message_sid']}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
+    except Exception as e:
+        print(f"⚠️  WhatsApp error: {e}")
 
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
@@ -678,8 +699,21 @@ def escalate_session(session_id):
     )
     db.session.add(ticket)
     db.session.commit()
-    return jsonify({"session": session.to_dict(), "ticket": ticket.to_dict()})
 
+    # ← NEW: Send WhatsApp message for ticket
+    try:
+        user = User.query.get(user_id)
+        if user and user.phone_number:
+            whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                print(f"✅ WhatsApp ticket alert sent to {user.phone_number}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
+    except Exception as e:
+        print(f"⚠️  WhatsApp error: {e}")
+
+    return jsonify({"session": session.to_dict(), "ticket": ticket.to_dict()})
 
 @app.route("/api/chat/session/<int:session_id>/send-summary-email", methods=["POST"])
 @jwt_required()
