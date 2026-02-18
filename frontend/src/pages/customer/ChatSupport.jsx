@@ -31,6 +31,13 @@ function isNetworkIssue(subprocessName) {
   return name.includes('network') || name.includes('signal');
 }
 
+function limitSubprocesses(subprocesses) {
+  const entries = Object.entries(subprocesses);
+  const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
+  const major = entries.filter(([, v]) => v !== 'Others' && !v.toLowerCase().includes('other'));
+  return Object.fromEntries([...major.slice(0, 5), ...others]);
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const [searchParams] = useSearchParams();
