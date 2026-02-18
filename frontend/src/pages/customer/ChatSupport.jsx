@@ -24,12 +24,19 @@ function formatResolution(text) {
     .replace(/\n/g, '<br>');
 }
 
+// ── Check if subprocess is network/signal related ──
+function isNetworkIssue(subprocessName) {
+  if (!subprocessName) return false;
+  const name = subprocessName.toLowerCase();
+  return name.includes('network') || name.includes('signal');
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const [searchParams] = useSearchParams();
 
   // ── Init-phase state ──
-  const [initPhase, setInitPhase] = useState('loading'); // loading | feedback-gate | resume-prompt | chat
+  const [initPhase, setInitPhase] = useState('loading');
   const [pendingFeedback, setPendingFeedback] = useState([]);
   const [currentFbIdx, setCurrentFbIdx] = useState(0);
   const [activeSessionData, setActiveSessionData] = useState(null);
@@ -45,6 +52,11 @@ export default function ChatSupport() {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [disabledGroups, setDisabledGroups] = useState(new Set());
+
+  // ── Location state ──
+  const [locationStatus, setLocationStatus] = useState('idle'); // idle | requesting | granted | denied | blocked
+  const locationRetryRef = useRef(null);
+
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
@@ -103,9 +115,7 @@ export default function ChatSupport() {
         content,
         ...meta,
       });
-    } catch (e) {
-      // silently fail
-    }
+    } catch (e) {}
   }, []);
 
   // ── Create a new session on backend ──
@@ -115,15 +125,90 @@ export default function ChatSupport() {
       if (data.session) {
         sessionIdRef.current = data.session.id;
       }
-    } catch (e) {
-      // silently fail
-    }
+    } catch (e) {}
   }, []);
+
+  // ══════════════════════════════════════════════════════════════════
+  // LOCATION FUNCTIONS
+  // ══════════════════════════════════════════════════════════════════
+
+  // ── Save location to backend ──
+  const saveLocationToBackend = useCallback(async (latitude, longitude) => {
+    if (!sessionIdRef.current) return;
+    try {
+      const token = getToken();
+      await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ latitude, longitude }),
+      });
+    } catch (e) {}
+  }, []);
+
+  // ── Request Location — forced, no skip option ──
+  const requestLocation = useCallback((onSuccess) => {
+    setLocationStatus('requesting');
+
+    if (!navigator.geolocation) {
+      // Browser doesn't support geolocation — very rare
+      addMessage({
+        type: 'system',
+        text: 'Your browser does not support location services. Please use a modern browser.',
+      });
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      // SUCCESS
+      (position) => {
+        const { latitude, longitude } = position.coords;
+        setLocationStatus('granted');
+
+        // Save to backend
+        saveLocationToBackend(latitude, longitude);
+
+        // Show success message in chat
+        addMessage({
+          type: 'location-success',
+          latitude,
+          longitude,
+        });
+        saveMessage('system', `Customer location shared: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
+
+        // Continue the chat flow
+        if (onSuccess) onSuccess();
+      },
+      // ERROR — user denied or error
+      (error) => {
+        setLocationStatus('denied');
+
+        // Show location required message — user MUST allow
+        const locGroupId = nextId();
+        addMessage({
+          type: 'location-required',
+          groupId: locGroupId,
+          onRetry: () => {
+            disableGroup(locGroupId);
+            requestLocation(onSuccess);
+          },
+        });
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
+      }
+    );
+  }, [addMessage, saveMessage, saveLocationToBackend, disableGroup]);
 
   // ── Start Chat (fresh) ──
   const startChat = useCallback(async () => {
     setMessages([]);
     setDisabledGroups(new Set());
+    setLocationStatus('idle');
     stateRef.current = {
       step: 'welcome', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
@@ -256,6 +341,47 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text: name });
     saveMessage('user', name, { subprocess_name: name });
 
+    // ── LOCATION TRIGGER — If Network/Signal issue, request location FIRST ──
+    if (isNetworkIssue(name)) {
+      // Create session first so we have an ID to save location against
+      if (!sessionIdRef.current) {
+        await createSession();
+      }
+
+      addMessage({
+        type: 'bot',
+        html: `You selected <strong>${name}</strong>.<br><br>` +
+          `📍 <strong>Location Required</strong><br>` +
+          `To help diagnose your network issue, we need your current location to check signal coverage in your area.<br><br>` +
+          `Please click <strong>"Share My Location"</strong> in the browser popup to continue.`,
+      });
+
+      // Show location prompt message
+      const locGroupId = nextId();
+      addMessage({
+        type: 'location-prompt',
+        groupId: locGroupId,
+        onShare: () => {
+          disableGroup(locGroupId);
+          requestLocation(() => {
+            // After location is granted, continue to ask for issue description
+            setTimeout(() => {
+              addMessage({
+                type: 'bot',
+                html: `Thank you! Your location has been recorded. ✅<br><br>Now please <strong>describe your specific network issue</strong> so I can provide the best resolution.`,
+              });
+              showInput('Describe your network issue in any language...');
+              stateRef.current.step = 'query';
+            }, 500);
+          });
+        },
+      });
+
+      stateRef.current.step = 'location';
+      return;
+    }
+
+    // ── Normal flow for non-network issues ──
     addMessage({
       type: 'bot',
       html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
@@ -263,9 +389,9 @@ export default function ChatSupport() {
 
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, saveMessage, showInput]);
+  }, [addMessage, disableGroup, saveMessage, showInput, createSession, requestLocation]);
 
-  // ── Send Message (user describes issue for next solution) ──
+  // ── Send Message ──
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
     if (!text) return;
@@ -334,7 +460,7 @@ export default function ChatSupport() {
     stateRef.current.step = 'resolved';
   }, [addMessage, disableGroup, saveMessage]);
 
-  // ── Unsatisfied → Ask for query or escalate after 5 attempts ──
+  // ── Unsatisfied ──
   const handleUnsatisfied = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'No, my issue is not resolved' });
@@ -390,7 +516,7 @@ export default function ChatSupport() {
     stateRef.current.step = 'sector';
   }, [addMessage, disableGroup, loadSectorMenu]);
 
-  // ── Exit → Send summary email + goodbye ──
+  // ── Exit ──
   const handleExit = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Exit' });
@@ -427,7 +553,7 @@ export default function ChatSupport() {
     stateRef.current.step = 'query';
   }, [addMessage, disableGroup, showInput]);
 
-  // ── Human Handoff → Raise Ticket ──
+  // ── Human Handoff ──
   const handleHumanHandoff = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Connect me to a human agent' });
@@ -489,9 +615,7 @@ export default function ChatSupport() {
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   }, []);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RESUME CHAT — restore an active session
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Resume Chat ──
   const resumeChat = useCallback(async (session, msgs) => {
     setInitPhase('chat');
     setMessages([]);
@@ -499,15 +623,12 @@ export default function ChatSupport() {
     hideInput();
 
     sessionIdRef.current = session.id;
-
-    // Restore stateRef from session metadata
     stateRef.current.sectorName = session.sector_name || null;
     stateRef.current.subprocessName = session.subprocess_name || null;
     stateRef.current.language = session.language || 'English';
     stateRef.current.queryText = session.query_text || '';
     stateRef.current.resolution = session.resolution || '';
 
-    // Reverse-lookup sector key from menu
     try {
       const token = getToken();
       const headers = {};
@@ -521,7 +642,6 @@ export default function ChatSupport() {
         }
       }
 
-      // Reverse-lookup subprocess key
       if (stateRef.current.sectorKey && session.subprocess_name) {
         const spData = await chatApiCall('/api/subprocesses', {
           sector_key: stateRef.current.sectorKey,
@@ -536,11 +656,9 @@ export default function ChatSupport() {
       }
     } catch {}
 
-    // Show "resuming" system message
     const resumeMsg = { type: 'system', text: `Resuming your previous chat session #${session.id}` };
     setMessages([{ ...resumeMsg, id: nextId(), groupId: nextId() }]);
 
-    // Render previous messages as history
     const botResolutions = [];
     const newMsgs = [];
     for (const m of msgs) {
@@ -565,7 +683,6 @@ export default function ChatSupport() {
     setMessages(prev => [...prev, ...newMsgs]);
     scrollToBottom();
 
-    // Determine current step and show appropriate interactive UI
     setTimeout(async () => {
       if (!session.sector_name) {
         addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' });
@@ -598,9 +715,7 @@ export default function ChatSupport() {
     }, 400);
   }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput]);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  FEEDBACK GATE — submit feedback for a pending session
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Feedback Gate ──
   const handleFeedbackSubmit = useCallback(async () => {
     if (fbRating === 0) return;
     const session = pendingFeedback[currentFbIdx];
@@ -616,11 +731,9 @@ export default function ChatSupport() {
     setFbRating(0);
     setFbComment('');
 
-    // Move to next pending session or proceed
     if (currentFbIdx + 1 < pendingFeedback.length) {
       setCurrentFbIdx(prev => prev + 1);
     } else {
-      // All feedback submitted — proceed to check active session
       proceedAfterFeedback();
     }
   }, [fbRating, fbComment, pendingFeedback, currentFbIdx]);
@@ -628,7 +741,6 @@ export default function ChatSupport() {
   const proceedAfterFeedback = useCallback(async () => {
     const resumeId = searchParams.get('resume');
 
-    // Check for direct resume from URL param
     if (resumeId) {
       try {
         const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -641,7 +753,6 @@ export default function ChatSupport() {
       } catch {}
     }
 
-    // Check for any active session
     const activeData = await apiGet('/api/customer/active-session');
     if (activeData?.session) {
       setActiveSessionData(activeData.session);
@@ -650,20 +761,16 @@ export default function ChatSupport() {
       return;
     }
 
-    // No active session → fresh chat
     startChat();
   }, [searchParams, startChat]);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  INITIALIZATION
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Initialization ──
   const initialized = useRef(false);
   useEffect(() => {
     if (initialized.current) return;
     initialized.current = true;
 
     (async () => {
-      // 1. Check pending feedback
       try {
         const fbData = await apiGet('/api/customer/pending-feedback');
         if (fbData?.sessions?.length > 0) {
@@ -674,7 +781,6 @@ export default function ChatSupport() {
         }
       } catch {}
 
-      // 2. Check for resume from URL or active session
       const resumeId = searchParams.get('resume');
       if (resumeId) {
         try {
@@ -696,14 +802,13 @@ export default function ChatSupport() {
         return;
       }
 
-      // 3. No pending feedback, no active session → start fresh
       startChat();
     })();
   }, []);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — messages
-  // ═══════════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════
+  // RENDER MESSAGES
+  // ══════════════════════════════════════════════════════════════════
   const renderMessage = (msg) => {
     const isDisabled = disabledGroups.has(msg.groupId);
 
@@ -791,6 +896,123 @@ export default function ChatSupport() {
           </div>
         );
 
+      // ── LOCATION PROMPT — shown when user selects Network/Signal issue ──
+      case 'location-prompt':
+        return (
+          <div key={msg.id} style={{
+            background: 'linear-gradient(135deg, #eff6ff, #dbeafe)',
+            border: '2px solid #3b82f6',
+            borderRadius: '14px',
+            padding: '20px 24px',
+            margin: '8px 0',
+            textAlign: 'center',
+          }}>
+            <div style={{ fontSize: '40px', marginBottom: '10px' }}>📍</div>
+            <div style={{ fontWeight: '700', fontSize: '16px', color: '#1e40af', marginBottom: '8px' }}>
+              Location Access Required
+            </div>
+            <div style={{ fontSize: '13px', color: '#374151', marginBottom: '16px', lineHeight: '1.6' }}>
+              To diagnose your network issue and check signal coverage in your area,
+              we need your current location. This is <strong>required</strong> to continue.
+            </div>
+            <button
+              onClick={() => !isDisabled && msg.onShare && msg.onShare()}
+              disabled={isDisabled}
+              style={{
+                background: isDisabled ? '#94a3b8' : '#2563eb',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '10px',
+                padding: '12px 28px',
+                fontSize: '14px',
+                fontWeight: '600',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                margin: '0 auto',
+              }}
+            >
+              📍 Share My Location
+            </button>
+            <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '10px' }}>
+              Your location is only used for network diagnostics and stored securely.
+            </div>
+          </div>
+        );
+
+      // ── LOCATION REQUIRED — shown if user denied, must retry ──
+      case 'location-required':
+        return (
+          <div key={msg.id} style={{
+            background: 'linear-gradient(135deg, #fff7ed, #ffedd5)',
+            border: '2px solid #f97316',
+            borderRadius: '14px',
+            padding: '20px 24px',
+            margin: '8px 0',
+            textAlign: 'center',
+          }}>
+            <div style={{ fontSize: '40px', marginBottom: '10px' }}>⚠️</div>
+            <div style={{ fontWeight: '700', fontSize: '16px', color: '#c2410c', marginBottom: '8px' }}>
+              Location Access Denied
+            </div>
+            <div style={{ fontSize: '13px', color: '#374151', marginBottom: '8px', lineHeight: '1.6' }}>
+              Location access is <strong>mandatory</strong> to proceed with your network complaint.
+            </div>
+            <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '16px', lineHeight: '1.5' }}>
+              👉 Please click the <strong>lock/location icon</strong> in your browser address bar
+              and set Location to <strong>"Allow"</strong>, then try again.
+            </div>
+            <button
+              onClick={() => !isDisabled && msg.onRetry && msg.onRetry()}
+              disabled={isDisabled}
+              style={{
+                background: isDisabled ? '#94a3b8' : '#ea580c',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '10px',
+                padding: '12px 28px',
+                fontSize: '14px',
+                fontWeight: '600',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                margin: '0 auto',
+                display: 'block',
+              }}
+            >
+              🔄 Try Again
+            </button>
+          </div>
+        );
+
+      // ── LOCATION SUCCESS — shown after location granted ──
+      case 'location-success':
+        return (
+          <div key={msg.id} style={{
+            background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
+            border: '2px solid #22c55e',
+            borderRadius: '14px',
+            padding: '16px 20px',
+            margin: '8px 0',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '14px',
+          }}>
+            <div style={{ fontSize: '32px' }}>✅</div>
+            <div>
+              <div style={{ fontWeight: '700', fontSize: '14px', color: '#15803d' }}>
+                Location Captured Successfully
+              </div>
+              <div style={{ fontSize: '12px', color: '#374151', marginTop: '4px' }}>
+                📍 Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                Long: <strong>{msg.longitude?.toFixed(6)}</strong>
+              </div>
+              <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                Stored securely for network diagnostics
+              </div>
+            </div>
+          </div>
+        );
+
       case 'unsat-options': {
         const options = [
           { cls: 'retry', icon: '', title: 'Describe Again', desc: 'Provide more details for better resolution steps', fn: () => handleRetry(msg.groupId) },
@@ -853,9 +1075,7 @@ export default function ChatSupport() {
     }
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — Feedback Gate Screen
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Feedback Gate Screen ──
   const renderFeedbackGate = () => {
     const session = pendingFeedback[currentFbIdx];
     if (!session) return null;
@@ -871,7 +1091,6 @@ export default function ChatSupport() {
               <span className="gate-counter"> ({currentFbIdx + 1} of {pendingFeedback.length})</span>
             )}
           </p>
-
           <div className="gate-session-info">
             <div className="gate-session-row">
               <span className="gate-label">Category</span>
@@ -898,7 +1117,6 @@ export default function ChatSupport() {
               </div>
             )}
           </div>
-
           <div className="gate-rating">
             <label>Rate your experience</label>
             <div className="gate-stars">
@@ -914,7 +1132,6 @@ export default function ChatSupport() {
               {fbRating === 0 ? 'Click a star to rate' : `${fbRating}/5`}
             </span>
           </div>
-
           <div className="gate-comment">
             <label>Comments (optional)</label>
             <textarea
@@ -924,7 +1141,6 @@ export default function ChatSupport() {
               rows={3}
             />
           </div>
-
           <button
             className="gate-submit-btn"
             disabled={fbRating === 0 || fbSubmitting}
@@ -937,9 +1153,7 @@ export default function ChatSupport() {
     );
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — Resume Prompt Screen
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Resume Prompt Screen ──
   const renderResumePrompt = () => {
     const session = activeSessionData;
     if (!session) return null;
@@ -956,7 +1170,6 @@ export default function ChatSupport() {
           <p className="gate-subtitle">
             You have an active chat session. Would you like to continue or start a new one?
           </p>
-
           <div className="gate-session-info">
             <div className="gate-session-row">
               <span className="gate-label">Session</span>
@@ -987,7 +1200,6 @@ export default function ChatSupport() {
               </div>
             )}
           </div>
-
           <div className="gate-actions">
             <button
               className="gate-btn gate-btn-primary"
@@ -1007,9 +1219,7 @@ export default function ChatSupport() {
     );
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  MAIN RENDER
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Main Render ──
   return (
     <div className="chat-support-page">
       <div className="app-container">
