@@ -16,9 +16,10 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
+    phone_number = db.Column(db.String(20), nullable=True)  # ← WhatsApp phone number
     password_hash = db.Column(db.String(256), nullable=False)
-    role = db.Column(db.String(20), nullable=False, default="customer")  # customer, manager, human_agent, cto, admin
-    employee_id = db.Column(db.String(20), unique=True, nullable=True)  # e.g. MGR00001, HA00001, CTO00001, ADM00001
+    role = db.Column(db.String(20), nullable=False, default="customer")
+    employee_id = db.Column(db.String(20), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     chat_sessions = db.relationship("ChatSession", backref="user", lazy=True)
@@ -36,6 +37,7 @@ class User(db.Model):
             "id": self.id,
             "name": self.name,
             "email": self.email,
+            "phone_number": self.phone_number,
             "role": self.role,
             "employee_id": self.employee_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -51,11 +53,13 @@ class ChatSession(db.Model):
     subprocess_name = db.Column(db.String(200), default="")
     query_text = db.Column(db.Text, default="")
     resolution = db.Column(db.Text, default="")
-    status = db.Column(db.String(30), default="active")  # active, resolved, escalated
+    status = db.Column(db.String(30), default="active")
     language = db.Column(db.String(50), default="English")
     summary = db.Column(db.Text, default="")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     resolved_at = db.Column(db.DateTime, nullable=True)
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
 
     messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
     ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
@@ -75,7 +79,8 @@ class ChatSession(db.Model):
             "summary": self.summary,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
-            "ticket_id": self.ticket.id if self.ticket else None,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
         }
 
 
@@ -84,7 +89,7 @@ class ChatMessage(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
-    sender = db.Column(db.String(20), nullable=False)  # user, bot, system
+    sender = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -108,8 +113,8 @@ class Ticket(db.Model):
     category = db.Column(db.String(200), default="General")
     subcategory = db.Column(db.String(200), default="")
     description = db.Column(db.Text, default="")
-    status = db.Column(db.String(30), default="pending")  # pending, in_progress, resolved, escalated
-    priority = db.Column(db.String(20), default="medium")  # low, medium, high, critical
+    status = db.Column(db.String(30), default="pending")
+    priority = db.Column(db.String(20), default="medium")
     assigned_to = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     resolution_notes = db.Column(db.Text, default="")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
@@ -166,7 +171,7 @@ class Feedback(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     chat_session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=True)
-    rating = db.Column(db.Integer, default=0)  # 1-5
+    rating = db.Column(db.Integer, default=0)
     comment = db.Column(db.Text, default="")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
