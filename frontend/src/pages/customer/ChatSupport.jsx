@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { getToken, apiGet, apiPost } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
@@ -40,6 +40,7 @@ function limitSubprocesses(subprocesses) {
 
 export default function ChatSupport() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
   // ── Init-phase state ──
@@ -229,8 +230,7 @@ export default function ChatSupport() {
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `<strong>Welcome to TeleBot Support!</strong><br><br>` +
-          `We're delighted to have you here. Please say hello to get started — we'd love to hear from you!`,
+        html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!`,
       });
       showInput('Type your greeting here...');
     }, 500);
@@ -355,7 +355,7 @@ export default function ChatSupport() {
       addMessage({
         type: 'bot',
         html: `You selected <strong>${name}</strong>.<br><br>` +
-          `📍 <strong>Location Required</strong><br>` +
+          `<strong>Location Required</strong><br>` +
           `To help diagnose your network issue, we need your current location to check signal coverage in your area.<br><br>` +
           `Please click <strong>"Share My Location"</strong> in the browser popup to continue.`,
       });
@@ -372,7 +372,7 @@ export default function ChatSupport() {
             setTimeout(() => {
               addMessage({
                 type: 'bot',
-                html: `Thank you! Your location has been recorded. ✅<br><br>Now please <strong>describe your specific network issue</strong> so I can provide the best resolution.`,
+                html: `Thank you! Your location has been recorded.<br><br>Now please <strong>describe your specific network issue</strong> so I can provide the best resolution.`,
               });
               showInput('Describe your network issue in any language...');
               stateRef.current.step = 'query';
@@ -419,7 +419,7 @@ export default function ChatSupport() {
       if (!isGreeting) {
         addMessage({
           type: 'bot',
-          html: `That doesn't look like a greeting. Please say hello to get started — we'd love to hear from you! 😊`,
+          html: `Please say hello to get started!`,
         });
         showInput('Type your greeting here...');
         return;
@@ -431,18 +431,9 @@ export default function ChatSupport() {
       setIsTyping(false);
       addMessage({
         type: 'bot',
-        html: `<strong>Hello, ${userName}!</strong><br><br>` +
-          `What a lovely greeting — thank you so much for reaching out! It's wonderful to have you here.<br><br>` +
-          `I'm your AI-powered telecom support assistant, ready to help you with any issues related to mobile, broadband, DTH, landline, and enterprise services.<br><br>` +
-          `<em>Feel free to type in any language — I'll respond in your preferred language.</em>`,
+        html: `Hi ${userName}! I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:`,
       });
-      setTimeout(() => {
-        addMessage({
-          type: 'bot',
-          html: `<strong>How can I help you today?</strong><br>Please select your telecom service category below:`,
-        });
-        setTimeout(() => loadSectorMenu(), 400);
-      }, 1000);
+      setTimeout(() => loadSectorMenu(), 600);
       stateRef.current.step = 'sector';
       return;
     }
@@ -573,11 +564,13 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text: 'Exit' });
     hideInput();
 
-    if (sessionIdRef.current) {
-      addMessage({ type: 'system', text: 'Sending chat summary to your email...' });
+    const currentSessionId = sessionIdRef.current;
+
+    if (currentSessionId) {
+      addMessage({ type: 'system', text: 'Sending chat summary to your email & WhatsApp...' });
       try {
         const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/send-summary-email`, {
+        const resp = await fetch(`${API_BASE}/api/chat/session/${currentSessionId}/send-summary-email`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         });
@@ -588,9 +581,12 @@ export default function ChatSupport() {
       } catch {}
     }
 
-    addMessage({ type: 'exit-box' });
     stateRef.current.step = 'exited';
-  }, [addMessage, disableGroup, hideInput]);
+    // Redirect to feedback page for this session after a short delay
+    setTimeout(() => {
+      navigate(`/customer/feedback${currentSessionId ? `?session=${currentSessionId}` : ''}`);
+    }, 1500);
+  }, [addMessage, disableGroup, hideInput, navigate]);
 
   // ── Retry ──
   const handleRetry = useCallback((groupId) => {
@@ -967,7 +963,7 @@ export default function ChatSupport() {
             margin: '8px 0',
             textAlign: 'center',
           }}>
-            <div style={{ fontSize: '40px', marginBottom: '10px' }}>📍</div>
+            <div style={{ fontSize: '32px', marginBottom: '10px', color: '#2563eb' }}>&#9906;</div>
             <div style={{ fontWeight: '700', fontSize: '16px', color: '#1e40af', marginBottom: '8px' }}>
               Location Access Required
             </div>
@@ -993,7 +989,7 @@ export default function ChatSupport() {
                 margin: '0 auto',
               }}
             >
-              📍 Share My Location
+              Share My Location
             </button>
             <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '10px' }}>
               Your location is only used for network diagnostics and stored securely.
@@ -1012,7 +1008,7 @@ export default function ChatSupport() {
             margin: '8px 0',
             textAlign: 'center',
           }}>
-            <div style={{ fontSize: '40px', marginBottom: '10px' }}>⚠️</div>
+            <div style={{ fontSize: '32px', marginBottom: '10px', color: '#ea580c' }}>!</div>
             <div style={{ fontWeight: '700', fontSize: '16px', color: '#c2410c', marginBottom: '8px' }}>
               Location Access Denied
             </div>
@@ -1020,7 +1016,7 @@ export default function ChatSupport() {
               Location access is <strong>mandatory</strong> to proceed with your network complaint.
             </div>
             <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '16px', lineHeight: '1.5' }}>
-              👉 Please click the <strong>lock/location icon</strong> in your browser address bar
+              Please click the <strong>lock/location icon</strong> in your browser address bar
               and set Location to <strong>"Allow"</strong>, then try again.
             </div>
             <button
@@ -1039,7 +1035,7 @@ export default function ChatSupport() {
                 display: 'block',
               }}
             >
-              🔄 Try Again
+              Try Again
             </button>
           </div>
         );
@@ -1057,13 +1053,13 @@ export default function ChatSupport() {
             alignItems: 'center',
             gap: '14px',
           }}>
-            <div style={{ fontSize: '32px' }}>✅</div>
+            <div style={{ fontSize: '24px', color: '#22c55e', fontWeight: 700 }}>&#10003;</div>
             <div>
               <div style={{ fontWeight: '700', fontSize: '14px', color: '#15803d' }}>
                 Location Captured Successfully
               </div>
               <div style={{ fontSize: '12px', color: '#374151', marginTop: '4px' }}>
-                📍 Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
                 Long: <strong>{msg.longitude?.toFixed(6)}</strong>
               </div>
               <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
@@ -1284,7 +1280,7 @@ export default function ChatSupport() {
     <div className="chat-support-page">
       <div className="app-container">
         <div className="header">
-          <div className="header-icon" style={{ fontSize: 20, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
+          <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 24 }} />
           <div className="header-info">
             <h1>Customer Handling</h1>
             <p>AI-powered multilingual support</p>

@@ -62,7 +62,7 @@ def send_whatsapp_message(to_number, message_body):
 
 def format_chat_summary_for_whatsapp(session, user_name):
     """
-    Format chat summary as WhatsApp message
+    Format chat summary as WhatsApp message (matches email content).
 
     Args:
         session: ChatSession object
@@ -71,20 +71,31 @@ def format_chat_summary_for_whatsapp(session, user_name):
     Returns:
         str: Formatted message
     """
-    message = f"🤖 *TeleBot - Chat Summary*\n\n"
-    message += f"Hello {user_name}!\n\n"
+    message = f"🤖 *TeleBot - Chat Summary Report*\n\n"
+    message += f"Hello {user_name}!\n"
+    message += f"Here is the summary of your recent support chat session:\n\n"
     message += f"📋 *Session #{session.id}*\n"
     message += f"📂 Category: {session.sector_name or 'N/A'}\n"
     message += f"🔧 Issue: {session.subprocess_name or 'N/A'}\n"
-    message += f"📊 Status: {session.status.upper()}\n\n"
+    message += f"📊 Status: {session.status.upper()}\n"
+    message += f"🌐 Language: {session.language or 'English'}\n"
+    if session.created_at:
+        message += f"📅 Date: {session.created_at.strftime('%B %d, %Y at %I:%M %p')}\n"
 
     if session.summary:
-        message += f"📝 *Summary:*\n{session.summary}\n\n"
+        message += f"\n📝 *Chat Summary:*\n{session.summary}\n"
 
     if session.query_text:
-        message += f"❓ *Your Query:*\n{session.query_text[:200]}...\n\n"
+        message += f"\n❓ *Your Query:*\n{session.query_text}\n"
 
-    message += f"Thank you for using TeleBot! 🙏"
+    # Include ticket reference if a ticket was raised
+    ticket = getattr(session, 'ticket', None)
+    if ticket:
+        message += f"\n🎫 *Escalation Ticket*\n"
+        message += f"Reference: {ticket.reference_number}\n"
+        message += f"Priority: {ticket.priority.upper()}\n"
+
+    message += f"\nIf you have further questions, feel free to start a new chat session anytime.\nThank you for using TeleBot! 🙏"
 
     return message
 

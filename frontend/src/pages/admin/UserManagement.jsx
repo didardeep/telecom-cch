@@ -35,9 +35,18 @@ export default function UserManagement() {
     loadUsers();
   };
 
+  const validatePassword = (pw) => {
+    if (pw.length < 7) return 'Password must be at least 7 characters long';
+    if (!/[A-Z]/.test(pw)) return 'Password must contain at least 1 uppercase letter';
+    if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?`~]/.test(pw)) return 'Password must contain at least 1 special character';
+    return null;
+  };
+
   const handleAdd = async (e) => {
     e.preventDefault();
     setAddError('');
+    const pwErr = validatePassword(addForm.password);
+    if (pwErr) { setAddError(pwErr); return; }
     setAddLoading(true);
     try {
       const res = await apiPost('/api/admin/users', addForm);
@@ -63,7 +72,11 @@ export default function UserManagement() {
   const handleUpdate = async (id) => {
     setEditError('');
     const payload = { name: editData.name, email: editData.email, role: editData.role };
-    if (editData.password) payload.password = editData.password;
+    if (editData.password) {
+      const pwErr = validatePassword(editData.password);
+      if (pwErr) { setEditError(pwErr); return; }
+      payload.password = editData.password;
+    }
     try {
       const res = await apiPut(`/api/admin/users/${id}`, payload);
       if (res.error) {
@@ -204,7 +217,7 @@ export default function UserManagement() {
               </div>
               <div className="form-group" style={{ margin: 0 }}>
                 <label style={{ fontSize: 12, fontWeight: 600 }}>Password</label>
-                <input type="password" className="form-input" placeholder="Min 6 characters" required
+                <input type="password" className="form-input" placeholder="Min 7 chars, 1 upper, 1 special" required minLength={7}
                   value={addForm.password} onChange={e => setAddForm(f => ({ ...f, password: e.target.value }))} />
               </div>
               <div className="form-group" style={{ margin: 0 }}>

@@ -20,6 +20,8 @@ from flask_mail import Mail, Message
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
+from sqlalchemy import case as sql_case
+from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
@@ -49,6 +51,12 @@ db.init_app(app)
 bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
+
+# ─── OTP Storage (in-memory) ────────────────────────────────────────────────
+otp_store = {}
+OTP_EXPIRY_MINUTES = 5
+OTP_MAX_ATTEMPTS = 5
+OTP_COOLDOWN_SECONDS = 60
 
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
@@ -415,6 +423,18 @@ def generate_ref_number():
     return f"TC-{ts}-{rand}"
 
 
+def validate_password(password):
+    """Return an error string if the password is invalid, else None."""
+    import re
+    if len(password) < 7:
+        return "Password must be at least 7 characters long"
+    if not re.search(r"[A-Z]", password):
+        return "Password must contain at least 1 uppercase letter"
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>/?`~]", password):
+        return "Password must contain at least 1 special character"
+    return None
+
+
 def auto_assign_priority(query_text, subprocess_name):
     """Simple priority assignment based on keywords."""
     text = (query_text + " " + subprocess_name).lower()
@@ -425,6 +445,55 @@ def auto_assign_priority(query_text, subprocess_name):
     if any(w in text for w in ["slow", "intermittent", "billing", "wrong charge", "refund"]):
         return "medium"
     return "low"
+
+
+def generate_otp():
+    """Generate a 6-digit numeric OTP."""
+    return ''.join(random.choices(string.digits, k=6))
+
+
+def cleanup_expired_otps():
+    """Remove expired OTPs from the store."""
+    now = datetime.now(timezone.utc)
+    expired = [e for e, d in otp_store.items() if d["expires_at"] < now]
+    for e in expired:
+        del otp_store[e]
+
+
+def send_otp_email(user_email, user_name, otp_code):
+    """Send OTP verification email."""
+    html_body = f"""
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
+        <div style="background: linear-gradient(135deg, #00338d 0%, #004fc4 100%); padding: 24px 30px; text-align: center;">
+            <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 600;">Customer Handling</h1>
+            <p style="color: rgba(255,255,255,0.8); margin: 4px 0 0; font-size: 13px;">Login Verification Code</p>
+        </div>
+        <div style="padding: 30px;">
+            <p style="color: #1e293b; font-size: 15px; margin: 0 0 20px;">Hello <strong>{user_name}</strong>,</p>
+            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin: 0 0 24px;">
+                Your one-time verification code for logging in:
+            </p>
+            <div style="background: #f8fafc; border: 2px solid #00338d; border-radius: 10px; padding: 24px; margin-bottom: 24px; text-align: center;">
+                <span style="font-size: 36px; font-weight: 700; color: #00338d; letter-spacing: 8px;">{otp_code}</span>
+            </div>
+            <p style="color: #64748b; font-size: 14px; margin: 0 0 8px;">
+                This code is valid for <strong>{OTP_EXPIRY_MINUTES} minutes</strong>. Do not share it with anyone.
+            </p>
+            <p style="color: #94a3b8; font-size: 13px; margin: 0;">
+                If you did not request this code, please ignore this email.
+            </p>
+        </div>
+        <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 30px; text-align: center;">
+            <p style="color: #94a3b8; font-size: 12px; margin: 0;">Customer Handling &mdash; AI-Powered Support</p>
+        </div>
+    </div>
+    """
+    msg = Message(
+        subject="Your Login Verification Code - Customer Handling",
+        recipients=[user_email],
+        html=html_body,
+    )
+    mail.send(msg)
 
 
 
@@ -442,6 +511,10 @@ def register():
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
 
+    pw_err = validate_password(password)
+    if pw_err:
+        return jsonify({"error": pw_err}), 400
+
     # ← NEW: Validate phone number
     if not phone_number:
         return jsonify({"error": "Phone number is required"}), 400
@@ -458,15 +531,87 @@ def register():
     return jsonify({"token": token, "user": user.to_dict()}), 201
 
 
+@app.route("/api/auth/send-otp", methods=["POST"])
+def send_otp():
+    """Step 1: check email and send OTP if employee."""
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({"error": "Invalid email address"}), 404
+
+    # Customers skip OTP
+    if user.role == "customer":
+        return jsonify({"requires_otp": False}), 200
+
+    # Rate limit check
+    cleanup_expired_otps()
+    if email in otp_store:
+        created = otp_store[email].get("created_at", datetime.now(timezone.utc))
+        elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+        if elapsed < OTP_COOLDOWN_SECONDS:
+            remaining = int(OTP_COOLDOWN_SECONDS - elapsed)
+            return jsonify({"error": f"Please wait {remaining} seconds before requesting a new code"}), 429
+
+    # Generate and store OTP
+    otp_code = generate_otp()
+    otp_store[email] = {
+        "code": otp_code,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES),
+        "attempts": 0,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    try:
+        send_otp_email(user.email, user.name, otp_code)
+    except Exception as e:
+        print(f"OTP email failed: {e}")
+        del otp_store[email]
+        return jsonify({"error": "Failed to send verification code. Please try again."}), 500
+
+    return jsonify({"requires_otp": True, "message": "Verification code sent to your email"}), 200
+
+
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     data = request.json
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
+    otp = data.get("otp", "").strip()
 
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid email or password"}), 401
+
+    # Employees must provide OTP
+    if user.role != "customer":
+        if not otp:
+            return jsonify({"error": "Verification code is required"}), 400
+
+        cleanup_expired_otps()
+        stored = otp_store.get(email)
+
+        if not stored:
+            return jsonify({"error": "No verification code found. Please request a new one."}), 400
+
+        if datetime.now(timezone.utc) > stored["expires_at"]:
+            del otp_store[email]
+            return jsonify({"error": "Verification code has expired. Please request a new one."}), 400
+
+        if stored["attempts"] >= OTP_MAX_ATTEMPTS:
+            del otp_store[email]
+            return jsonify({"error": "Too many failed attempts. Please request a new code."}), 429
+
+        if stored["code"] != otp:
+            stored["attempts"] += 1
+            remaining = OTP_MAX_ATTEMPTS - stored["attempts"]
+            return jsonify({"error": f"Invalid verification code. {remaining} attempts remaining."}), 401
+
+        # OTP verified — consume it
+        del otp_store[email]
 
     token = create_access_token(identity=str(user.id))
     return jsonify({"token": token, "user": user.to_dict()})
@@ -858,6 +1003,10 @@ def send_summary_email(session_id):
     </div>
     """
 
+    email_ok = False
+    whatsapp_ok = False
+
+    # Send email
     try:
         msg = Message(
             subject=f"Chat Summary - {session.sector_name or 'Telecom Support'} (Session #{session.id})",
@@ -865,9 +1014,34 @@ def send_summary_email(session_id):
             html=html_body,
         )
         mail.send(msg)
-        return jsonify({"message": f"Summary sent to {user.email}"}), 200
+        email_ok = True
     except Exception as e:
-        return jsonify({"error": f"Failed to send email: {str(e)}"}), 500
+        print(f"⚠️  Email failed: {e}")
+
+    # Send WhatsApp
+    if user.phone_number:
+        try:
+            whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                whatsapp_ok = True
+                print(f"✅ WhatsApp summary sent to {user.phone_number}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
+        except Exception as e:
+            print(f"⚠️  WhatsApp error: {e}")
+
+    # Build response message
+    parts = []
+    if email_ok:
+        parts.append(f"email ({user.email})")
+    if whatsapp_ok:
+        parts.append(f"WhatsApp ({user.phone_number})")
+
+    if parts:
+        return jsonify({"message": f"Summary sent to {' and '.join(parts)}", "email_sent": email_ok, "whatsapp_sent": whatsapp_ok}), 200
+    else:
+        return jsonify({"error": "Failed to send summary. Please try again later.", "email_sent": False, "whatsapp_sent": False}), 500
 
 
 @app.route("/api/chat/session/<int:session_id>", methods=["GET"])
@@ -890,27 +1064,45 @@ def get_chat_session(session_id):
 @jwt_required()
 def customer_dashboard():
     user_id = int(get_jwt_identity())
-    total = ChatSession.query.filter_by(user_id=user_id).count()
-    resolved = ChatSession.query.filter_by(user_id=user_id, status="resolved").count()
-    escalated = ChatSession.query.filter_by(user_id=user_id, status="escalated").count()
-    active = ChatSession.query.filter_by(user_id=user_id, status="active").count()
+
+    # Single query for all chat stats
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).filter_by(user_id=user_id).group_by(ChatSession.status).all()
+    stat_map = dict(chat_stats)
+    total = sum(stat_map.values())
+
     pending_tickets = Ticket.query.filter_by(user_id=user_id).filter(
         Ticket.status.in_(["pending", "in_progress"])
     ).count()
 
-    recent_sessions = ChatSession.query.filter_by(user_id=user_id).order_by(
-        ChatSession.created_at.desc()
-    ).all()
+    # Fetch recent sessions with user eagerly loaded + feedback ratings in one join
+    recent_sessions = db.session.query(ChatSession, Feedback.rating).outerjoin(
+        Feedback, db.and_(
+            Feedback.chat_session_id == ChatSession.id,
+            Feedback.user_id == user_id,
+        )
+    ).filter(
+        ChatSession.user_id == user_id
+    ).options(
+        joinedload(ChatSession.user)
+    ).order_by(ChatSession.created_at.desc()).limit(50).all()
+
+    sessions_data = []
+    for s, rating in recent_sessions:
+        sd = s.to_dict()
+        sd["rating"] = rating
+        sessions_data.append(sd)
 
     return jsonify({
         "stats": {
             "total_chats": total,
-            "resolved": resolved,
-            "escalated": escalated,
-            "active": active,
+            "resolved": stat_map.get("resolved", 0),
+            "escalated": stat_map.get("escalated", 0),
+            "active": stat_map.get("active", 0),
             "pending_tickets": pending_tickets,
         },
-        "recent_sessions": [s.to_dict() for s in recent_sessions],
+        "recent_sessions": sessions_data,
     })
 
 
@@ -1016,23 +1208,46 @@ def manager_dashboard():
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    total_chats = ChatSession.query.count()
-    resolved_chats = ChatSession.query.filter_by(status="resolved").count()
-    escalated_chats = ChatSession.query.filter_by(status="escalated").count()
-    active_chats = ChatSession.query.filter_by(status="active").count()
+    # Chat stats — single GROUP BY
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).group_by(ChatSession.status).all()
+    chat_map = dict(chat_stats)
+    total_chats = sum(chat_map.values())
+    resolved_chats = chat_map.get("resolved", 0)
+    escalated_chats = chat_map.get("escalated", 0)
+    active_chats = chat_map.get("active", 0)
 
-    total_tickets = Ticket.query.count()
-    pending_tickets = Ticket.query.filter_by(status="pending").count()
-    in_progress_tickets = Ticket.query.filter_by(status="in_progress").count()
-    resolved_tickets = Ticket.query.filter_by(status="resolved").count()
-    escalated_tickets = Ticket.query.filter_by(status="escalated").count()
+    # Ticket stats — single GROUP BY for status
+    ticket_stats = db.session.query(
+        Ticket.status, db.func.count(Ticket.id)
+    ).group_by(Ticket.status).all()
+    ts_map = dict(ticket_stats)
+    total_tickets = sum(ts_map.values())
+    pending_tickets = ts_map.get("pending", 0)
+    in_progress_tickets = ts_map.get("in_progress", 0)
+    resolved_tickets = ts_map.get("resolved", 0)
+    escalated_tickets = ts_map.get("escalated", 0)
 
-    critical_tickets = Ticket.query.filter_by(priority="critical", status="pending").count()
-    high_tickets = Ticket.query.filter_by(priority="high", status="pending").count()
+    # Critical/high pending tickets — single query
+    urgent_stats = db.session.query(
+        Ticket.priority, db.func.count(Ticket.id)
+    ).filter_by(status="pending").filter(
+        Ticket.priority.in_(["critical", "high"])
+    ).group_by(Ticket.priority).all()
+    urgent_map = dict(urgent_stats)
+    critical_tickets = urgent_map.get("critical", 0)
+    high_tickets = urgent_map.get("high", 0)
 
-    total_feedback = Feedback.query.count()
-    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
-    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    # Feedback — single aggregation query
+    fb_agg = db.session.query(
+        db.func.count(Feedback.id),
+        db.func.avg(sql_case((Feedback.rating > 0, Feedback.rating))),
+        db.func.sum(sql_case((Feedback.rating >= 4, 1), else_=0)),
+    ).first()
+    total_feedback = fb_agg[0] or 0
+    avg_rating = fb_agg[1] or 0
+    satisfied_count = fb_agg[2] or 0
     csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     total_users = User.query.filter_by(role="customer").count()
@@ -1239,24 +1454,43 @@ def admin_dashboard():
 
     total_users = sum(c[1] for c in user_counts)
 
-    # Chat stats
-    total_chats = ChatSession.query.count()
-    resolved_chats = ChatSession.query.filter_by(status="resolved").count()
-    escalated_chats = ChatSession.query.filter_by(status="escalated").count()
-    active_chats = ChatSession.query.filter_by(status="active").count()
+    # Chat stats — single GROUP BY query
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).group_by(ChatSession.status).all()
+    chat_map = dict(chat_stats)
+    total_chats = sum(chat_map.values())
+    resolved_chats = chat_map.get("resolved", 0)
+    escalated_chats = chat_map.get("escalated", 0)
+    active_chats = chat_map.get("active", 0)
 
-    # Ticket stats
-    total_tickets = Ticket.query.count()
-    pending_tickets = Ticket.query.filter_by(status="pending").count()
-    in_progress_tickets = Ticket.query.filter_by(status="in_progress").count()
-    resolved_tickets = Ticket.query.filter_by(status="resolved").count()
-    critical_tickets = Ticket.query.filter_by(priority="critical").count()
-    high_tickets = Ticket.query.filter_by(priority="high").count()
+    # Ticket status stats — single GROUP BY query
+    ticket_status_stats = db.session.query(
+        Ticket.status, db.func.count(Ticket.id)
+    ).group_by(Ticket.status).all()
+    ts_map = dict(ticket_status_stats)
+    total_tickets = sum(ts_map.values())
+    pending_tickets = ts_map.get("pending", 0)
+    in_progress_tickets = ts_map.get("in_progress", 0)
+    resolved_tickets = ts_map.get("resolved", 0)
 
-    # Feedback
-    total_feedback = Feedback.query.count()
-    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
-    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    # Ticket priority stats — single GROUP BY query
+    ticket_priority_stats = db.session.query(
+        Ticket.priority, db.func.count(Ticket.id)
+    ).group_by(Ticket.priority).all()
+    tp_map = dict(ticket_priority_stats)
+    critical_tickets = tp_map.get("critical", 0)
+    high_tickets = tp_map.get("high", 0)
+
+    # Feedback — single query for count, avg, and satisfied
+    fb_agg = db.session.query(
+        db.func.count(Feedback.id),
+        db.func.avg(sql_case((Feedback.rating > 0, Feedback.rating))),
+        db.func.sum(sql_case((Feedback.rating >= 4, 1), else_=0)),
+    ).first()
+    total_feedback = fb_agg[0] or 0
+    avg_rating = fb_agg[1] or 0
+    satisfied_count = fb_agg[2] or 0
     csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     # Resolution rate
@@ -1332,6 +1566,9 @@ def admin_create_user():
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
+    pw_err = validate_password(password)
+    if pw_err:
+        return jsonify({"error": pw_err}), 400
     if role not in ("customer", "manager", "human_agent", "cto", "admin"):
         return jsonify({"error": "Invalid role"}), 400
     if User.query.filter_by(email=email).first():
@@ -1460,6 +1697,9 @@ def admin_update_user(uid):
         else:
             target.employee_id = generate_employee_id(new_role)
     if "password" in data and data["password"]:
+        pw_err = validate_password(data["password"])
+        if pw_err:
+            return jsonify({"error": pw_err}), 400
         target.set_password(data["password"])
 
     db.session.commit()
@@ -1875,7 +2115,7 @@ def reports_csat():
     monthly_csat = db.session.query(
         db.func.date_trunc("month", Feedback.created_at).label("month"),
         db.func.count(Feedback.id).label("total"),
-        db.func.count(db.case((Feedback.rating >= 4, 1))).label("satisfied")
+        db.func.count(sql_case((Feedback.rating >= 4, 1))).label("satisfied")
     ).filter(Feedback.created_at >= start_date).group_by("month").order_by("month").all()
 
     # Feedback distribution (1-5 stars)
