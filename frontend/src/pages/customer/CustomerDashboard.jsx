@@ -22,10 +22,16 @@ export default function CustomerDashboard() {
 
   const handleClearChat = async (e, sessionId) => {
     e.stopPropagation();
+    // Remove the row immediately so the UI responds at once
+    setData(prev => prev ? {
+      ...prev,
+      recent_sessions: prev.recent_sessions.filter(s => s.id !== sessionId),
+    } : prev);
     try {
       await apiPut(`/api/chat/session/${sessionId}/resolve`, {});
-      refreshDashboard();
     } catch {}
+    // Refresh in background to sync stats counts
+    refreshDashboard();
   };
 
   if (loading) return <div className="page-loader"><div className="spinner" /></div>;

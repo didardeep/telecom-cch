@@ -53,7 +53,7 @@ mail = Mail(app)
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key="808cf0ccab8445b39c6d8767a7e2c433",
+    api_key="",
     api_version="2023-07-01-preview",
     azure_endpoint="https://entgptaiuat.openai.azure.com"
 )
@@ -243,6 +243,38 @@ def identify_subprocess(query: str, sector_key: str) -> str:
         return result.get("matched_subprocess", "General Inquiry")
     except Exception:
         return "General Inquiry"
+
+
+def detect_greeting(text: str) -> bool:
+    """Semantically determine whether a message is a greeting in any language."""
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": (
+                    "Determine if the user's message is a greeting or salutation in ANY language or mixed language. "
+                    "A greeting includes (but is not limited to): hello, hi, hey, hiya, howdy, good morning, "
+                    "good afternoon, good evening, namaste, namaskar, salaam, assalamu alaikum, "
+                    "bonjour, hola, ciao, salam, sat sri akal, vanakkam, adab, greetings, what's up, "
+                    "yo, sup, hii, helo, hai, or informal/phonetic variants in any script. "
+                    "Mixed-language greetings (e.g. 'hello aur kaise ho', 'hi there bhai') also count. "
+                    'Respond with ONLY valid JSON: {"is_greeting": true} or {"is_greeting": false}'
+                )},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=20,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        result = json.loads(raw)
+        return bool(result.get("is_greeting", True))
+    except Exception:
+        return True   # fail-open: treat ambiguous input as a greeting
 
 
 def detect_language(text: str) -> str:
@@ -553,6 +585,14 @@ def detect_lang():
     text = data.get("text", "")
     language = detect_language(text)
     return jsonify({"language": language})
+
+
+@app.route("/api/detect-greeting", methods=["POST"])
+def detect_greeting_route():
+    data = request.json
+    text = data.get("text", "")
+    is_greeting = detect_greeting(text)
+    return jsonify({"is_greeting": is_greeting})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1453,6 +1493,51 @@ def admin_delete_user(uid):
     db.session.delete(target)
     db.session.commit()
     return jsonify({"message": "User deleted"})
+
+
+@app.route("/api/admin/agent-tickets", methods=["GET"])
+@jwt_required()
+def admin_agent_tickets():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    status = request.args.get("status")
+    agent_id = request.args.get("agent_id")
+    search = request.args.get("search")
+
+    # Alias User for the assignee join
+    AgentUser = db.aliased(User)
+    query = (
+        Ticket.query
+        .join(AgentUser, Ticket.assigned_to == AgentUser.id)
+        .filter(AgentUser.role == "human_agent")
+    )
+
+    if status:
+        query = query.filter(Ticket.status == status)
+    if agent_id:
+        query = query.filter(Ticket.assigned_to == int(agent_id))
+    if search:
+        CustomerUser = db.aliased(User)
+        query = (
+            query
+            .join(CustomerUser, Ticket.user_id == CustomerUser.id)
+            .filter(db.or_(
+                CustomerUser.name.ilike(f"%{search}%"),
+                CustomerUser.email.ilike(f"%{search}%"),
+                Ticket.reference_number.ilike(f"%{search}%"),
+            ))
+        )
+
+    tickets = query.order_by(Ticket.created_at.desc()).all()
+    agents = User.query.filter_by(role="human_agent").order_by(User.name).all()
+
+    return jsonify({
+        "tickets": [t.to_dict() for t in tickets],
+        "agents": [{"id": a.id, "name": a.name} for a in agents],
+    })
 
 
 @app.route("/api/admin/feedback", methods=["GET"])

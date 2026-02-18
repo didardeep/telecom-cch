@@ -20,6 +20,7 @@ import AdminDashboard from './pages/admin/AdminDashboard';
 import UserManagement from './pages/admin/UserManagement';
 import AdminFeedback from './pages/admin/AdminFeedback';
 import ReportsPage from './pages/admin/ReportsPage';
+import AgentIssues from './pages/admin/AgentIssues';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -79,6 +80,7 @@ export default function App() {
         <Route path="tickets" element={<ActiveTickets />} />
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
+        <Route path="agent-issues" element={<AgentIssues />} />
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
       </Route>
