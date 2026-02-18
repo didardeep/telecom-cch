@@ -6,6 +6,7 @@ import { apiPost } from '../api';
 export default function RegisterPage() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');  // ← NEW
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -18,7 +19,8 @@ export default function RegisterPage() {
     setLoading(true);
 
     try {
-      const data = await apiPost('/api/auth/register', { name, email, password });
+      // ← UPDATED: Now sends phone_number
+      const data = await apiPost('/api/auth/register', { name, email, phone_number: phone, password });
       if (data.error) {
         setError(data.error);
       } else {
@@ -65,6 +67,25 @@ export default function RegisterPage() {
               required
             />
           </div>
+
+          {/* ← NEW: Phone Number Field */}
+          <div className="form-group">
+            <label>Phone Number (WhatsApp)</label>
+            <input
+              type="tel"
+              className="form-input"
+              placeholder="+919876543210"
+              value={phone}
+              onChange={e => setPhone(e.target.value)}
+              required
+              pattern="^\+?[1-9]\d{1,14}$"
+              title="Enter phone number with country code (e.g., +919876543210)"
+            />
+            <small style={{ color: '#6b7280', fontSize: '12px' }}>
+              Include country code (e.g., +91 for India)
+            </small>
+          </div>
+
           <div className="form-group">
             <label>Password</label>
             <input
