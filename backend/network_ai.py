@@ -52,6 +52,19 @@ def _ensure_ai_session_tables():
         NetworkAiMessage.__table__.create(db.engine, checkfirst=True)
     except Exception:
         pass
+    # ── CHANGE: migration-safe — add new columns if table already exists ──
+    try:
+        with db.engine.connect() as conn:
+            from sqlalchemy import inspect as sa_inspect
+            cols = {c["name"] for c in sa_inspect(db.engine).get_columns("network_ai_sessions")}
+            if "session_context" not in cols:
+                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN session_context JSON DEFAULT '{}'"))
+                conn.commit()
+            if "conversation_summary" not in cols:
+                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN conversation_summary TEXT"))
+                conn.commit()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,12 +98,19 @@ def ai_query():
         _ensure_ai_session_tables()
         ai_session = db.session.get(NetworkAiSession, int(session_id))
         if ai_session and ai_session.user_id == int(uid):
+            # ── CHANGE: load last 10 messages (5 turns) + prepend summary ──
             recent_msgs = (NetworkAiMessage.query
                           .filter_by(session_id=session_id)
                           .order_by(NetworkAiMessage.created_at.desc())
-                          .limit(20)
+                          .limit(10)
                           .all())
             recent_msgs.reverse()
+            # Prepend rolling summary so LLM retains full history context
+            if getattr(ai_session, 'conversation_summary', None):
+                conversation_history.append({
+                    "role": "system",
+                    "content": f"Conversation so far: {ai_session.conversation_summary}",
+                })
             for m in recent_msgs:
                 if m.role == "user":
                     conversation_history.append({
@@ -175,31 +195,195 @@ Tables:
    'DL PRB Utilization (1BH)'           -- DL PRB utilization %, congestion
    'UL PRB Utilization (1BH)'           -- UL PRB utilization %
 
-2. telecom_sites(site_id, cell_id, latitude, longitude, zone)
-   - JOIN: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
-   - zone column has values like zone names / cluster names
+2. telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
+   - JOIN with kpi_data: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
+   - zone = cluster/region name, city = city name, state = state name
+   - technology = 'LTE', '4G', '5G', etc.
+   - site_status = 'on_air' or 'off_air'
 
-3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
-   - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
-   - kpi_type = 'revenue' for revenue data
+3. flexible_kpi_uploads — EAV (Entity-Attribute-Value) table for Core and Revenue data
+   Columns: id, kpi_type, site_id, column_name, column_type, num_value, str_value
+   - This is NOT a flat table. Each ROW stores ONE metric for ONE site.
+   - column_type = 'numeric' → value is in num_value column
+   - column_type = 'text'    → value is in str_value column
+   - Alias the table as f: FROM flexible_kpi_uploads f
+
+   === Revenue data (kpi_type = 'revenue') ===
+   column_name values for revenue:
+     'subscribers'      — subscriber count per site (numeric)
+     'revenue_jan_l'    — January revenue in Lakhs (numeric)
+     'revenue_feb_l'    — February revenue in Lakhs (numeric)
+     'revenue_mar_l'    — March revenue in Lakhs (numeric)
+     ... through 'revenue_dec_l' — pattern: revenue_<mon>_l
+     'opex_jan_l'       — January OPEX in Lakhs (numeric)
+     'opex_feb_l'       — February OPEX in Lakhs (numeric)
+     ... through 'opex_dec_l' — pattern: opex_<mon>_l
+     'zone'             — geographic zone (text, in str_value)
+     'technology'       — technology type (text, in str_value)
+     'site_category'    — site classification (text, in str_value)
+
+   Example: Get total revenue per site:
+     SELECT f.site_id, SUM(f.num_value) AS total_revenue
+     FROM flexible_kpi_uploads f
+     WHERE f.kpi_type = 'revenue'
+       AND f.column_name LIKE 'revenue\\_%' AND f.column_type = 'numeric'
+     GROUP BY f.site_id ORDER BY total_revenue DESC
+
+   Example: Get subscribers for a specific site:
+     SELECT f.site_id, f.num_value AS subscribers
+     FROM flexible_kpi_uploads f
+     WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+       AND f.site_id = 'GUR_LTE_1500'
+
+   Example: Get revenue for a specific month (March):
+     SELECT f.site_id, f.num_value AS revenue_mar
+     FROM flexible_kpi_uploads f
+     WHERE f.kpi_type = 'revenue' AND f.column_name = 'revenue_mar_l'
+
+   Example: Compare revenue vs OPEX for a site:
+     SELECT f.site_id, f.column_name, f.num_value
+     FROM flexible_kpi_uploads f
+     WHERE f.kpi_type = 'revenue'
+       AND f.column_name IN ('revenue_jan_l','revenue_feb_l','revenue_mar_l','opex_jan_l','opex_feb_l','opex_mar_l')
+       AND f.site_id = 'GUR_LTE_1500'
+
+   === Core KPI data (kpi_type = 'core') ===
+   column_name values for core:
+     'auth_success_rate'           — Authentication Success Rate (numeric, %)
+     'cpu_utilization'             — CPU Utilization (numeric, %)
+     'attach_success_rate'         — Attach Success Rate (numeric, %)
+     'pdp_bearer_setup_success_rate' — PDP Bearer Setup Success Rate (numeric, %)
+
+   Example: Get core KPIs for a site:
+     SELECT f.site_id, f.column_name, f.num_value
+     FROM flexible_kpi_uploads f
+     WHERE f.kpi_type = 'core' AND f.site_id = 'GUR_LTE_1500'
 
 === Natural Language → KPI Mapping Guide ===
-User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
-User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
-User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)'
-User says "availability" / "uptime" / "downtime" → 'Availability'
-User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue'
-User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate'
-User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang'
-User says "latency" / "delay" / "ping" → 'Average Latency Downlink'
-User says "data volume" / "traffic volume" → 'DL Data Total Volume'
-User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
-User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
-User says "noise" / "interference" → 'Average NI of Carrier-'
+User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1' (kpi_data)
+User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' or 'LTE DL - Cell Ave Throughput' (kpi_data)
+User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)' (kpi_data)
+User says "availability" / "uptime" / "downtime" → 'Availability' (kpi_data)
+User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue' (kpi_data)
+User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate' (kpi_data)
+User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang' (kpi_data)
+User says "latency" / "delay" / "ping" → 'Average Latency Downlink' (kpi_data)
+User says "data volume" / "traffic volume" → 'DL Data Total Volume' (kpi_data)
+User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate' (kpi_data)
+User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate' (kpi_data)
+User says "noise" / "interference" → 'Average NI of Carrier-' (kpi_data)
+User says "revenue" / "income" / "earning" → revenue_data OR flexible_kpi_uploads with kpi_type='revenue'
+User says "OPEX" / "operating cost" / "expenditure" → revenue_data (opex_jan/feb/mar) OR flexible_kpi_uploads
+User says "subscribers" / "subscriber count" / "customer count" → revenue_data.subscribers OR flexible_kpi_uploads
+User says "ARPU" → revenue / subscribers (compute from revenue_data)
+User says "core KPI" / "authentication" / "CPU" / "attach" / "PDP" → core_kpi_data table
+User says "transport" / "backhaul" / "microwave" / "fiber" / "jitter" → transport_kpi_data table
+User says "link capacity" / "link utilization" / "backhaul latency" → transport_kpi_data table
+User says "network issue" / "worst cell" / "tickets" / "AI tickets" → network_issue_tickets table
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+
+4. transport_kpi_data — Transport/backhaul network KPI data
+   Columns: id, site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
+            packet_loss, avg_latency, jitter, availability, error_rate, tput_efficiency, alarms
+   - backhaul_type = 'microwave', 'fiber', 'copper'
+   - avg_util / peak_util = utilization percentages
+   - availability = link uptime %
+
+   Example: Get transport KPIs for a site:
+     SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+     FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
+
+   Example: Sites with high packet loss:
+     SELECT t.site_id, t.packet_loss, t.avg_latency, t.backhaul_type
+     FROM transport_kpi_data t WHERE t.packet_loss > 1 ORDER BY t.packet_loss DESC
+
+5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
+   Columns: id, site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
+   - auth_sr = authentication success rate (%)
+   - cpu_util = CPU utilization (%)
+   - attach_sr = device attach success rate (%)
+   - pdp_sr = PDP bearer setup success rate (%)
+
+   Example: Core KPIs for a site over time:
+     SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
+     FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
+
+6. revenue_data — Revenue per site (flat table, one row per site)
+   Columns: id, site_id, zone, technology, subscribers, rev_jan, rev_feb, rev_mar,
+            opex_jan, opex_feb, opex_mar, site_category
+   - rev_jan/feb/mar = monthly revenue (NOT daily — there is no date column)
+   - opex_jan/feb/mar = monthly OPEX
+
+   Example: Revenue and subscribers per site:
+     SELECT r.site_id, r.subscribers, r.rev_jan, r.rev_feb, r.rev_mar, r.zone
+     FROM revenue_data r ORDER BY r.subscribers DESC
+
+   Example: Top revenue sites:
+     SELECT r.site_id, (r.rev_jan + r.rev_feb + r.rev_mar) AS total_revenue, r.subscribers
+     FROM revenue_data r ORDER BY total_revenue DESC LIMIT 10
+
+7. network_issue_tickets — Auto-generated tickets for worst-performing cells
+   Columns: id, site_id, cells_affected, category, priority, priority_score, sla_hours,
+            avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, location,
+            assigned_agent, root_cause, recommendation, created_at
+   - status = 'open', 'in_progress', 'resolved'
+   - priority = 'Critical', 'High', 'Medium', 'Low'
+   - violations = number of KPI threshold breaches
+
+   Example: Open network issue tickets:
+     SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput, n.violations, n.status, n.zone
+     FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
+
+=== TABLE SELECTION RULE ===
+- RAN performance KPIs (drop rate, throughput, PRB, latency, etc.) → query kpi_data table
+- Revenue, OPEX, subscribers, ARPU → query revenue_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='revenue'
+- Core network KPIs (authentication, CPU, attach, PDP) → query core_kpi_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='core'
+- Transport/backhaul KPIs (link capacity, jitter, packet loss, backhaul) → query transport_kpi_data table
+- Network issue tickets (worst cells, AI tickets, open issues) → query network_issue_tickets table
+- Site info (zone, city, state, technology, location) → query telecom_sites table
+NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
+If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
 """
+
+    # ── Dynamic table availability — tell LLM which tables actually exist ──
+    try:
+        _tbl_rows = _sql(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name IN "
+            "('revenue_data','core_kpi_data','transport_kpi_data',"
+            "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites')"
+        )
+        _available_tables = {r['table_name'] for r in _tbl_rows}
+    except Exception:
+        _available_tables = set()
+
+    _tbl_note = "\n=== AVAILABLE TABLES (real-time, checked just now) ===\n"
+    for _tn, _fb in [
+        ('kpi_data', None),
+        ('telecom_sites', None),
+        ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
+        ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
+        ('transport_kpi_data', None),
+        ('network_issue_tickets', None),
+        ('flexible_kpi_uploads', None),
+    ]:
+        if _tn in _available_tables:
+            _tbl_note += f"  {_tn}: EXISTS — use it\n"
+        elif _fb:
+            _tbl_note += f"  {_tn}: DOES NOT EXIST — use {_fb} instead\n"
+        else:
+            _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
+    SCHEMA_HINT += _tbl_note
+
+    # ── CHANGE: read session_context for dynamic prompt injection ──
+    _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
+    _active_sites = ", ".join(_sctx.get("active_sites", [])) or "none yet"
+    _active_kpis  = ", ".join(_sctx.get("active_kpis", []))  or "none yet"
+    _active_days  = _sctx.get("active_days")
+    _active_days_str = f"last {_active_days} days" if _active_days else "not set"
+    _last_chart   = _sctx.get("last_chart_type", "bar")
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
 
@@ -208,6 +392,18 @@ READ THE USER QUERY VERY CAREFULLY. Understand EVERY part of it before generatin
 The user may write in English, Hindi, Hinglish, or any language. Understand the intent and translate to SQL.
 
 {SCHEMA_HINT}
+
+═══════════════════════════════════════════════════════════
+ACTIVE SESSION STATE (always inherit this for follow-ups):
+═══════════════════════════════════════════════════════════
+- Sites currently in focus: {_active_sites}
+- KPIs currently in focus:  {_active_kpis}
+- Time range in use:        {_active_days_str}
+- Last chart type:          {_last_chart}
+
+If the user's query does not mention a new site, inherit the active_sites above.
+If the user's query does not mention a new KPI, inherit the active_kpis above.
+If the user's query does not mention a new time range, inherit the active_days above.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL RULE #00 — CONVERSATION CONTEXT & FOLLOW-UPS:
@@ -298,8 +494,11 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
 5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
-7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
+7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL. NEVER use data_level='cell'.
 8. JOIN telecom_sites only when you need zone/geo data.
+9. In UNION ALL queries, NEVER put ORDER BY or LIMIT inside individual SELECT branches. Put ONE ORDER BY at the very end AFTER the last UNION ALL branch.
+10. "a week" / "1 week" = INTERVAL '7 days'. "a month" = INTERVAL '30 days'. Always convert to days.
+11. When user says "for both" or "for site A and site B", you MUST include ALL mentioned sites — never drop any.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -381,7 +580,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 parsed["response"] = parsed.get("title", "Results")
             for chart in parsed["charts"]:
                 if chart.get("sql"):
-                    chart["sql"] = _fix_site_ids_in_sql(chart["sql"])
+                    chart["sql"] = _sanitize_llm_sql(chart["sql"])
             return parsed
         ct = parsed.get("chart_type") or parsed.get("chart") or parsed.get("query_type") or "bar"
         parsed["chart_type"] = ct
@@ -397,14 +596,18 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if "chart_config" not in parsed:
             parsed["chart_config"] = {}
         if parsed.get("sql"):
-            parsed["sql"] = _fix_site_ids_in_sql(parsed["sql"])
+            parsed["sql"] = _sanitize_llm_sql(parsed["sql"])
         return parsed
 
-    def _fix_site_ids_in_sql(sql: str) -> str:
+    # ── CHANGE: comprehensive SQL sanitizer for all known LLM mistakes ──
+    def _sanitize_llm_sql(sql: str) -> str:
+        """Fix common LLM-generated SQL mistakes before execution."""
         import re
-        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
-        if not prompt_site_ids:
+        if not sql or not sql.strip():
             return sql
+
+        # 1. Fix truncated site IDs (LLM cuts off last chars)
+        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
         for correct_id in prompt_site_ids:
             for trim in range(1, 4):
                 truncated = correct_id[:-trim]
@@ -414,8 +617,58 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 replacement = r"\g<1>" + correct_id + r"\g<3>"
                 fixed = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
                 if fixed != sql:
-                    _LOG.info("Fixed truncated site ID in SQL: '%s' → '%s'", truncated, correct_id)
+                    _LOG.info("[SQL-fix] truncated site ID: '%s' → '%s'", truncated, correct_id)
                     sql = fixed
+
+        # 2. Fix ORDER BY inside UNION ALL branches (PostgreSQL syntax error)
+        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
+            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = []
+                for part in parts:
+                    part = re.sub(r'\s+ORDER\s+BY\s+[\w\s,.]+$', '', part.strip(), flags=re.IGNORECASE)
+                    cleaned.append(part)
+                sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
+                _LOG.info("[SQL-fix] moved ORDER BY to end of UNION ALL")
+
+        # 3. Fix data_level='cell' → 'site' (prompt rule #7 says ALWAYS 'site')
+        if re.search(r"data_level\s*=\s*'cell'", sql, re.IGNORECASE):
+            sql = re.sub(r"data_level\s*=\s*'cell'", "data_level = 'site'", sql, flags=re.IGNORECASE)
+            _LOG.info("[SQL-fix] changed data_level='cell' → 'site'")
+
+        # 4. Ensure k.date <= CURRENT_DATE cap exists when date range is used
+        if re.search(r"CURRENT_DATE\s*-\s*INTERVAL", sql, re.IGNORECASE):
+            if not re.search(r"date\s*<=\s*CURRENT_DATE", sql, re.IGNORECASE):
+                sql = re.sub(
+                    r"(CURRENT_DATE\s*-\s*INTERVAL\s*'[^']+'\s*)",
+                    r"\1AND k.date <= CURRENT_DATE ",
+                    sql, count=1, flags=re.IGNORECASE,
+                )
+                _LOG.info("[SQL-fix] added missing k.date <= CURRENT_DATE cap")
+
+        # 5. Ensure k.value IS NOT NULL exists
+        if 'kpi_data' in sql.lower() and 'is not null' not in sql.lower():
+            sql = re.sub(
+                r"(data_level\s*=\s*'site')",
+                r"\1 AND k.value IS NOT NULL",
+                sql, count=1, flags=re.IGNORECASE,
+            )
+            _LOG.info("[SQL-fix] added missing k.value IS NOT NULL")
+
+        # 6. Fix LIMIT inside UNION ALL branches (PostgreSQL syntax error)
+        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
+            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = []
+                for part in parts:
+                    part = re.sub(r'\s+LIMIT\s+\d+\s*$', '', part.strip(), flags=re.IGNORECASE)
+                    cleaned.append(part)
+                # Preserve the ORDER BY we already placed at end
+                if re.search(r'\bORDER\s+BY\b', cleaned[-1], re.IGNORECASE):
+                    sql = '\nUNION ALL\n'.join(cleaned)
+                else:
+                    sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
+
         return sql
 
     user_prompt = f"User query: {prompt}"
@@ -428,25 +681,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     llm_messages.extend(conversation_history)
     llm_messages.append({"role": "user", "content": user_prompt})
 
-    _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
-
-    azure_key        = _cfg("AZURE_OPENAI_API_KEY")
-    azure_endpoint   = _cfg("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
-    azure_version    = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-    gemini_key       = _cfg("GEMINI_API_KEY")
-    gemini_model     = _cfg("OPENAI_MODEL", "gemini-2.0-flash")
-    openai_key       = _cfg("OPENAI_API_KEY")
-
-    _providers = []
-    if azure_key and azure_endpoint:
-        _providers.append(("azure", azure_key, azure_endpoint, azure_deployment, azure_version))
-    if gemini_key:
-        _providers.append(("gemini", gemini_key, gemini_model))
-    if openai_key:
-        _providers.append(("openai", openai_key))
-
-    _LOG.info("AI providers available: %s", [p[0] for p in _providers])
+    from app import client as _llm_client, DEPLOYMENT_NAME as _llm_model
+    _LOG.info("AI provider: global client (%s)", _llm_model)
 
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
     # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
@@ -470,7 +706,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     _p_lower = prompt.lower().strip()
     _prompt_sites = _re_pre.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
-    _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
+    # ── CHANGE: use unified time parser instead of just regex for "last N days" ──
+    _prompt_days_int = _parse_time_to_days(_p_lower)
 
     # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
     if _is_followup(_p_lower):
@@ -484,84 +721,37 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # 2. Multi-site trend queries — rule-based reliably generates one chart per site
     #    with ALL requested KPIs, which LLMs often get wrong.
+    # ── CHANGE: detect "a week", "a month" etc. via _parse_time_to_days ──
     if not ai_result and len(_prompt_sites) >= 2:
         _is_trend_pre = (
-            bool(_prompt_days) or
-            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last'))
+            bool(_prompt_days_int) or
+            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last', 'week', 'month', 'year'))
         )
         if _is_trend_pre:
             ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    for _prov in _providers:
-        if ai_result:
-            break
-        ptype = _prov[0]
+    # 3. LLM handles all queries (revenue, core, transport, tickets, KPIs).
+    #    Dynamic schema (AVAILABLE TABLES section) tells LLM which tables exist.
+    #    Rule-based handlers remain as fallback if LLM SQL fails at execution.
+    if not ai_result:
         try:
-            if ptype == "azure":
-                from openai import AzureOpenAI as _AzureOpenAI
-                az_client = _AzureOpenAI(
-                    api_key=_prov[1], api_version=_prov[4],
-                    azure_endpoint=_prov[2], timeout=25.0,
-                )
-                az_resp = az_client.chat.completions.create(
-                    model=_prov[3],
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                    response_format={"type": "json_object"},
-                )
-                raw_content = az_resp.choices[0].message.content
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": f"azure-{_prov[3]}"}
-                    _LOG.info("AI query handled by Azure OpenAI (%s)", _prov[3])
-
-            elif ptype == "gemini":
-                from openai import OpenAI as _OpenAI
-                gem_client = _OpenAI(
-                    api_key=_prov[1],
-                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                    timeout=25.0,
-                )
-                gem_resp = gem_client.chat.completions.create(
-                    model=_prov[2],
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                raw_content = gem_resp.choices[0].message.content
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": _prov[2]}
-                    _LOG.info("AI query handled by Gemini (%s)", _prov[2])
-
-            elif ptype == "openai":
-                from openai import OpenAI as _OpenAI2
-                oai_client = _OpenAI2(api_key=_prov[1], timeout=25.0)
-                oai_resp = oai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                raw_content = oai_resp.choices[0].message.content
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": "openai-gpt-4o-mini"}
-                    _LOG.info("AI query handled by OpenAI direct")
-
+            _llm_resp = _llm_client.chat.completions.create(
+                model=_llm_model,
+                messages=llm_messages,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            raw_content = _llm_resp.choices[0].message.content
+            if raw_content:
+                ai_result = _parse_ai_result(raw_content)
+                provider = {"provider": _llm_model}
+                _LOG.info("AI query handled by %s", _llm_model)
         except json.JSONDecodeError as je:
-            _LOG.warning("%s LLM returned bad JSON, using rule-based fallback: %s", ptype.upper(), str(je)[:100])
-            continue
+            _LOG.warning("LLM returned bad JSON: %s", str(je)[:200])
         except Exception as e:
-            err_str = str(e).lower()
-            if "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str:
-                _LOG.warning("%s quota/rate limit hit — skipping to rule-based", ptype.upper())
-                break
-            _LOG.warning("%s LLM failed (will try next): %s", ptype.upper(), str(e)[:200])
-            continue
+            _LOG.warning("LLM call failed, falling back to rule-based: %s", str(e)[:200])
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
@@ -648,6 +838,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 db.session.commit()
             except Exception as e:
                 _LOG.error("Failed to persist AI message: %s", e)
+            # ── CHANGE: update session context + maybe summarize ──
+            _all_sqls = " ".join(ch.get("sql", "") for ch in charts_out)
+            _update_session_context(ai_session, _all_sqls, "multi_chart")
+            _maybe_summarize_conversation(ai_session)
 
         return jsonify({
             "response":     resp_text,
@@ -723,6 +917,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             db.session.commit()
         except Exception as e:
             _LOG.error("Failed to persist AI message: %s", e)
+        # ── CHANGE: update session context + maybe summarize ──
+        _update_session_context(ai_session, sql, resp_chart)
+        _maybe_summarize_conversation(ai_session)
 
     return jsonify({
         "response":      resp_text,
@@ -742,6 +939,185 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE: Session context tracking + conversation summarization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_session_context(sql_str, chart_type="bar"):
+    """Parse active sites, KPIs, days, chart type from an executed SQL string.
+    Returns a dict suitable for storing in ai_session.session_context."""
+    import re
+    ctx = {
+        "active_sites": [],
+        "active_kpis": [],
+        "active_days": None,
+        "last_chart_type": chart_type or "bar",
+        "last_sql": (sql_str or "")[:2000],
+    }
+    if not sql_str:
+        return ctx
+    ctx["active_sites"] = list(dict.fromkeys(re.findall(r"site_id\s*=\s*'([^']+)'", sql_str)))
+    ctx["active_kpis"]  = list(dict.fromkeys(re.findall(r"kpi_name\s*=\s*'([^']+)'", sql_str)))
+    days_m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", sql_str)
+    if days_m:
+        ctx["active_days"] = int(days_m.group(1))
+    return ctx
+
+
+def _update_session_context(ai_session, sql_str, chart_type="bar"):
+    """Update ai_session.session_context from the SQL that was just executed.
+    MERGES new sites/KPIs with existing ones so earlier context isn't lost.
+    Wrapped in try/except so it never breaks the main response."""
+    if not ai_session:
+        return
+    try:
+        new_ctx = _extract_session_context(sql_str, chart_type)
+        old_ctx = (getattr(ai_session, 'session_context', None) or {})
+
+        # ── CHANGE: merge instead of replace — keep last 8 sites/KPIs seen ──
+        merged_sites = list(dict.fromkeys(
+            old_ctx.get("active_sites", []) + new_ctx.get("active_sites", [])
+        ))[-8:]  # keep last 8 unique sites
+        merged_kpis = list(dict.fromkeys(
+            old_ctx.get("active_kpis", []) + new_ctx.get("active_kpis", [])
+        ))[-6:]  # keep last 6 unique KPIs
+
+        new_ctx["active_sites"] = merged_sites
+        new_ctx["active_kpis"]  = merged_kpis
+        # Days and chart type always use the latest
+        ai_session.session_context = new_ctx
+        db.session.commit()
+    except Exception as e:
+        _LOG.warning("Failed to update session_context: %s", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+def _maybe_summarize_conversation(ai_session):
+    """Generate a rolling summary — first at 8 messages, then every 8 after.
+    This ensures the summary exists BEFORE old messages drop out of the history window.
+    Wrapped in try/except so it never breaks the main response."""
+    if not ai_session:
+        return
+    try:
+        msg_count = NetworkAiMessage.query.filter_by(session_id=ai_session.id).count()
+        # ── CHANGE: trigger at 8 instead of 10, so summary exists before messages drop ──
+        if msg_count < 8 or msg_count % 8 != 0:
+            return
+
+        # Grab last 12 messages for summarization (wider window for better summary)
+        last_10 = (NetworkAiMessage.query
+                   .filter_by(session_id=ai_session.id)
+                   .order_by(NetworkAiMessage.created_at.desc())
+                   .limit(12).all())
+        last_10.reverse()
+        convo_text = "\n".join(
+            f"{m.role}: {m.content[:300]}" for m in last_10
+        )
+
+        summary_prompt = (
+            "Summarize this telecom analytics conversation in 3-4 sentences. "
+            "Focus on: which sites were analyzed, which KPIs were discussed, "
+            "what time ranges were used, and what insights were found.\n\n"
+            f"Conversation:\n{convo_text}"
+        )
+        summary_msgs = [
+            {"role": "system", "content": "You are a concise summarizer."},
+            {"role": "user", "content": summary_prompt},
+        ]
+
+        _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
+        azure_key   = _cfg("AZURE_OPENAI_API_KEY")
+        azure_ep    = _cfg("AZURE_OPENAI_ENDPOINT")
+        azure_dep   = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+        azure_ver   = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        gemini_key  = _cfg("GEMINI_API_KEY")
+        openai_key  = _cfg("OPENAI_API_KEY")
+
+        summary_text = None
+
+        if azure_key and azure_ep:
+            from openai import AzureOpenAI as _AzOAI
+            c = _AzOAI(api_key=azure_key, api_version=azure_ver, azure_endpoint=azure_ep, timeout=15.0)
+            r = c.chat.completions.create(model=azure_dep, messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+        elif gemini_key:
+            from openai import OpenAI as _OAI
+            c = _OAI(api_key=gemini_key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/", timeout=15.0)
+            r = c.chat.completions.create(model=_cfg("OPENAI_MODEL", "gemini-2.0-flash"), messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+        elif openai_key:
+            from openai import OpenAI as _OAI2
+            c = _OAI2(api_key=openai_key, timeout=15.0)
+            r = c.chat.completions.create(model="gpt-4o-mini", messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+
+        if summary_text:
+            ai_session.conversation_summary = summary_text.strip()
+            db.session.commit()
+            _LOG.info("Conversation summary updated for session %d (%d msgs)", ai_session.id, msg_count)
+    except Exception as e:
+        _LOG.warning("Summarization failed (non-fatal): %s", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared time-range parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── CHANGE: unified time parser that handles "a week", "1 month", "last 18 days", etc. ──
+def _parse_time_to_days(text: str):
+    """Extract a day count from natural-language time references.
+    Returns int (number of days) or None if no time reference found."""
+    import re
+    t = text.lower().strip()
+
+    # "last 18 days", "past 7 days", "recent 30 days"
+    m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', t)
+    if m:
+        return int(m.group(1))
+
+    # "18 days", "7 day" (bare number + days)
+    m = re.search(r'(\d+)\s*days?', t)
+    if m and not re.search(r'(top|bottom|worst|best)\s+' + m.group(1), t):
+        return int(m.group(1))
+
+    # Word-based: "a week", "one week", "1 week", "2 weeks", "a month", etc.
+    _WORD_MAP = {
+        'week': 7, 'weeks': 7,
+        'month': 30, 'months': 30,
+        'year': 365, 'years': 365,
+        'quarter': 90, 'quarters': 90,
+        'fortnight': 14, 'fortnights': 14,
+    }
+    # "last week", "a week", "1 week", "one week", "2 weeks", "last 3 months"
+    m = re.search(
+        r'(?:last|past|a|an|one|1|(\d+))\s+(week|weeks|month|months|year|years|quarter|quarters|fortnight|fortnights)',
+        t
+    )
+    if m:
+        multiplier = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(2)
+        return multiplier * _WORD_MAP.get(unit, 7)
+
+    # "for a week", "for one month"
+    m = re.search(
+        r'for\s+(?:a|an|one|1|(\d+))\s+(week|weeks|month|months|year|years|quarter|quarters)',
+        t
+    )
+    if m:
+        multiplier = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(2)
+        return multiplier * _WORD_MAP.get(unit, 7)
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -772,11 +1148,8 @@ def _is_followup(prompt_lower: str) -> bool:
 
     has_site     = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
     has_kpi      = any(kw in p for kw in _FU_KPI_WORDS)
-    has_days     = bool(re.search(r'last\s+\d+\s*days?', p))
-    has_time_ref = has_days or bool(re.search(
-        r'last\s+(year|month|week|quarter|6\s*months?|3\s*months?)'
-        r'|\d+\s*(month|year|week)s?|this\s+(year|month|week)', p
-    ))
+    # ── CHANGE: use unified time parser so "a week", "a month" are detected ──
+    has_time_ref = bool(_parse_time_to_days(p))
 
     # 1. Truly self-contained: site + explicit time reference → always fresh
     if has_site and has_time_ref:
@@ -919,12 +1292,8 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
 
     new_sites  = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
     new_kpi    = _detect_kpi(p)
-    new_days_m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
-    new_days   = int(new_days_m.group(1)) if new_days_m else None
-    if not new_days:
-        dm = re.search(r'(\d+)\s*days?', p)
-        if dm and not re.search(r'(top|bottom|worst|best)\s+' + dm.group(1), p):
-            new_days = int(dm.group(1))
+    # ── CHANGE: use unified time parser for "a week", "a month", etc. ──
+    new_days   = _parse_time_to_days(p)
 
     # ── FIX: Site switch — new site mentioned, no new KPI → inherit ALL previous KPIs ──
     # This handles: "i want to see for site id GUR_LTE_0001" after a multi-chart response.
@@ -1144,30 +1513,47 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     site_ids = list(dict.fromkeys(site_ids))
 
     KPI_MAP = {
-        'cssr':          ('LTE Call Setup Success Rate', 'cssr'),
-        'call setup':    ('LTE Call Setup Success Rate', 'cssr'),
-        'rrc':           ('LTE RRC Setup Success Rate', 'rrc_sr'),
-        'erab':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'e-rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'e rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'drop':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'cdr':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'throughput':    ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'tput':          ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'speed':         ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'prb':           ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'congestion':    ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'availability':  ('Availability', 'availability'),
-        'availab':       ('Availability', 'availability'),
-        'latency':       ('Average Latency Downlink', 'latency'),
-        'delay':         ('Average Latency Downlink', 'latency'),
-        'volte':         ('VoLTE Traffic Erlang', 'volte_erl'),
-        'handover':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
-        'volume':        ('DL Data Total Volume', 'dl_volume'),
-        'traffic':       ('DL Data Total Volume', 'dl_volume'),
-        'connected':     ('Ave RRC Connected Ue', 'avg_rrc_ue'),
-        'users':         ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'cssr':            ('LTE Call Setup Success Rate', 'cssr'),
+        'call setup':      ('LTE Call Setup Success Rate', 'cssr'),
+        'call success':    ('LTE Call Setup Success Rate', 'cssr'),
+        'rrc':             ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'accessibility':   ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'erab':            ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e rab':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'drop rate':       ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'call drop':       ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'cdr':             ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'call failure':    ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'throughput':      ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'tput':            ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'dl throughput':   ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'speed':           ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'download speed':  ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'mbps':            ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'prb':             ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congestion':      ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congested':       ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'utilization':     ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'overloaded':      ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'availability':    ('Availability', 'availability'),
+        'uptime':          ('Availability', 'availability'),
+        'downtime':        ('Availability', 'availability'),
+        'latency':         ('Average Latency Downlink', 'latency'),
+        'delay':           ('Average Latency Downlink', 'latency'),
+        'ping':            ('Average Latency Downlink', 'latency'),
+        'volte':           ('VoLTE Traffic Erlang', 'volte_erl'),
+        'voice traffic':   ('VoLTE Traffic Erlang', 'volte_erl'),
+        'handover':        ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'ho success':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'volume':          ('DL Data Total Volume', 'dl_volume'),
+        'data volume':     ('DL Data Total Volume', 'dl_volume'),
+        'traffic volume':  ('DL Data Total Volume', 'dl_volume'),
+        'connected':       ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'connected users': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'active users':    ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'noise':           ('Average NI of Carrier-', 'noise_interference'),
+        'interference':    ('Average NI of Carrier-', 'noise_interference'),
     }
 
     def _detect_kpis(text):
@@ -1180,9 +1566,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 seen.add(KPI_MAP[kw][0])
         return found
 
+    # ── CHANGE: use unified time parser to handle "a week", "a month", etc. ──
     def _extract_days(text):
-        m = re.search(r'last\s+(\d+)\s*days?', text.lower())
-        return int(m.group(1)) if m else None
+        return _parse_time_to_days(text)
 
     # _try_split_compound REMOVED — caused incorrect KPI-site pairing on "and" keyword
 
@@ -1199,8 +1585,336 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     detected_kpis = _detect_kpis(p)
     days          = _extract_days(p)
+    # ── CHANGE: also detect "week", "month", "year" as trend signals ──
     is_trend      = (bool(days) or 'trend' in p or 'over time' in p or
-                     'history' in p or 'daily' in p or 'last' in p)
+                     'history' in p or 'daily' in p or 'last' in p or
+                     'week' in p or 'month' in p or 'year' in p)
+
+    # ── Non-kpi_data table intercepts (revenue, core, transport, tickets) ──
+    # These tables have different schemas from kpi_data, so rule-based is more reliable.
+
+    _REVENUE_WORDS = {'revenue', 'income', 'earning', 'opex', 'expenditure', 'operating cost',
+                      'subscriber', 'subscribers', 'customer count', 'arpu'}
+    _CORE_WORDS = {'core kpi', 'core network', 'authentication', 'auth success', 'cpu utilization',
+                   'attach success', 'attach rate', 'pdp bearer', 'pdp setup',
+                   'auth sr', 'attach sr', 'pdp sr', 'cpu util'}
+    _TRANSPORT_WORDS = {'transport', 'backhaul', 'microwave', 'fiber', 'jitter',
+                        'link capacity', 'link utilization', 'backhaul latency',
+                        'packet loss', 'tput efficiency', 'error rate'}
+    _TICKET_WORDS = {'network issue', 'worst cell', 'ai ticket', 'network ticket',
+                     'open issue', 'open ticket', 'issue ticket', 'fault'}
+
+    _is_revenue   = any(w in p for w in _REVENUE_WORDS)
+    _is_core      = any(w in p for w in _CORE_WORDS)
+    _is_transport = any(w in p for w in _TRANSPORT_WORDS)
+    _is_ticket    = any(w in p for w in _TICKET_WORDS)
+
+    if _is_revenue or _is_core or _is_transport or _is_ticket:
+        site_filter_f = ""
+        site_filter_r = ""
+        site_filter_t = ""
+        site_filter_n = ""
+        if site_ids:
+            in_clause = ", ".join(f"'{s}'" for s in site_ids[:4])
+            site_filter_f = f"AND f.site_id IN ({in_clause})"
+            site_filter_r = f"AND r.site_id IN ({in_clause})"
+            site_filter_t = f"AND t.site_id IN ({in_clause})"
+            site_filter_n = f"AND n.site_id IN ({in_clause})"
+
+        # Check which optional tables actually exist
+        def _tbl_exists(name):
+            try:
+                rows = _sql(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = :tbl",
+                    {"tbl": name},
+                )
+                return len(rows) > 0
+            except Exception:
+                return False
+
+        # ── Revenue queries (revenue_data → flexible_kpi_uploads fallback) ──
+        if _is_revenue:
+            _has_rev_tbl = _tbl_exists("revenue_data")
+
+            # Extract "top N" / "bottom N" from prompt
+            _top_m = re.search(r'(?:top|best|highest)\s+(\d+)', p)
+            _bot_m = re.search(r'(?:bottom|worst|lowest|least)\s+(\d+)', p)
+            _rev_n = 10  # default
+            _rev_order = "DESC"
+            if _top_m:
+                _rev_n = min(int(_top_m.group(1)), 100)
+                _rev_order = "DESC"
+            elif _bot_m:
+                _rev_n = min(int(_bot_m.group(1)), 100)
+                _rev_order = "ASC"
+            elif any(w in p for w in ('worst', 'low', 'bottom', 'least')):
+                _rev_order = "ASC"
+            _limit = f"LIMIT {_rev_n}"
+
+            if not _has_rev_tbl:
+                # Fallback: use flexible_kpi_uploads EAV table
+                if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
+                    return {
+                        "sql": f"""SELECT f.site_id, f.num_value AS subscribers
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+                              AND f.num_value IS NOT NULL {site_filter_f}
+                            ORDER BY f.num_value {_rev_order} {_limit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — Subscribers",
+                        "x_axis": "site_id", "y_axes": ["subscribers"],
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by subscriber count.",
+                    }
+                elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
+                    return {
+                        "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_opex
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'opex\\_%'
+                              AND f.column_type = 'numeric' {site_filter_f}
+                            GROUP BY f.site_id
+                            ORDER BY total_opex {_rev_order} {_limit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
+                        "x_axis": "site_id", "y_axes": ["total_opex"],
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Highest'} {_rev_n} sites by total OPEX.",
+                    }
+                elif 'arpu' in p:
+                    return {
+                        "sql": f"""SELECT rev.site_id,
+                                   ROUND(CAST(rev.total_rev AS NUMERIC) / NULLIF(sub.subscribers, 0), 2) AS arpu
+                            FROM (
+                                SELECT f.site_id, SUM(f.num_value) AS total_rev
+                                FROM flexible_kpi_uploads f
+                                WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'revenue\\_%'
+                                  AND f.column_type = 'numeric' {site_filter_f}
+                                GROUP BY f.site_id
+                            ) rev
+                            JOIN (
+                                SELECT f.site_id, f.num_value AS subscribers
+                                FROM flexible_kpi_uploads f
+                                WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+                                  AND f.num_value > 0
+                            ) sub ON rev.site_id = sub.site_id
+                            ORDER BY arpu {_rev_order} {_limit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — ARPU",
+                        "x_axis": "site_id", "y_axes": ["arpu"],
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
+                    }
+                else:
+                    # Default: aggregate total revenue per site
+                    return {
+                        "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'revenue\\_%'
+                              AND f.column_type = 'numeric' {site_filter_f}
+                            GROUP BY f.site_id
+                            ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
+                        "x_axis": "site_id", "y_axes": ["total_revenue"],
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
+                    }
+
+            # revenue_data table exists — use flat table queries
+            if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
+                return {
+                    "sql": f"""SELECT r.site_id, r.subscribers
+                        FROM revenue_data r
+                        WHERE r.subscribers IS NOT NULL {site_filter_r}
+                        ORDER BY r.subscribers {_rev_order} {_limit}""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — Subscribers",
+                    "x_axis": "site_id", "y_axes": ["subscribers"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by subscriber count.",
+                }
+            elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
+                return {
+                    "sql": f"""SELECT r.site_id, r.opex_jan, r.opex_feb, r.opex_mar,
+                               (COALESCE(r.opex_jan,0)+COALESCE(r.opex_feb,0)+COALESCE(r.opex_mar,0)) AS total_opex
+                        FROM revenue_data r
+                        WHERE r.site_id IS NOT NULL {site_filter_r}
+                        ORDER BY total_opex {_rev_order} {_limit}""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
+                    "x_axis": "site_id", "y_axes": ["opex_jan", "opex_feb", "opex_mar"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Highest'} {_rev_n} sites by total OPEX.",
+                }
+            elif 'arpu' in p:
+                return {
+                    "sql": f"""SELECT r.site_id,
+                               ROUND(CAST((COALESCE(r.rev_jan,0) + COALESCE(r.rev_feb,0) + COALESCE(r.rev_mar,0))
+                                   AS NUMERIC) / NULLIF(r.subscribers, 0), 2) AS arpu
+                        FROM revenue_data r
+                        WHERE r.subscribers > 0 {site_filter_r}
+                        ORDER BY arpu {_rev_order} {_limit}""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — ARPU",
+                    "x_axis": "site_id", "y_axes": ["arpu"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
+                }
+            elif site_ids and is_trend:
+                # Revenue trend — unpivot monthly columns into time series
+                site_filter_lat = " OR ".join(f"r.site_id = '{s}'" for s in site_ids[:5])
+                return {
+                    "sql": f"""SELECT r.site_id, t.month_name, t.revenue, t.opex
+                        FROM revenue_data r
+                        CROSS JOIN LATERAL (VALUES
+                            ('Jan', 1, r.rev_jan, r.opex_jan),
+                            ('Feb', 2, r.rev_feb, r.opex_feb),
+                            ('Mar', 3, r.rev_mar, r.opex_mar)
+                        ) AS t(month_name, month_ord, revenue, opex)
+                        WHERE ({site_filter_lat})
+                        ORDER BY r.site_id, t.month_ord""",
+                    "query_type": "composed", "chart_type": "composed",
+                    "title": f"Revenue Trend — {', '.join(site_ids[:3])}",
+                    "x_axis": "month_name", "y_axes": ["revenue", "opex"],
+                    "response": f"Monthly revenue & OPEX for {', '.join(site_ids[:3])}. Revenue data is monthly (Jan-Mar).",
+                }
+            else:
+                return {
+                    "sql": f"""SELECT r.site_id, r.subscribers,
+                               r.rev_jan, r.rev_feb, r.rev_mar,
+                               (COALESCE(r.rev_jan,0) + COALESCE(r.rev_feb,0) + COALESCE(r.rev_mar,0)) AS total_revenue,
+                               r.zone, r.technology
+                        FROM revenue_data r
+                        WHERE r.site_id IS NOT NULL {site_filter_r}
+                        ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
+                    "x_axis": "site_id", "y_axes": ["total_revenue"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
+                }
+
+        # ── Shared: extract top/bottom N for non-revenue handlers too ──
+        _top_m2 = re.search(r'(?:top|best|highest)\s+(\d+)', p)
+        _bot_m2 = re.search(r'(?:bottom|worst|lowest|least)\s+(\d+)', p)
+        _hn = 10
+        _horder = "DESC"
+        if _top_m2:
+            _hn = min(int(_top_m2.group(1)), 100)
+        elif _bot_m2:
+            _hn = min(int(_bot_m2.group(1)), 100)
+            _horder = "ASC"
+        elif any(w in p for w in ('worst', 'low', 'bottom', 'least')):
+            _horder = "ASC"
+        _hlimit = f"LIMIT {_hn}"
+
+        # ── Core KPI queries (core_kpi_data → flexible_kpi_uploads fallback) ──
+        if _is_core:
+            if _tbl_exists("core_kpi_data"):
+                date_clause = ""
+                if days:
+                    date_clause = f"AND c.date >= CURRENT_DATE - INTERVAL '{days} days' AND c.date <= CURRENT_DATE"
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
+                            FROM core_kpi_data c
+                            WHERE c.site_id = '{site_ids[0]}' {date_clause}
+                            ORDER BY c.date""",
+                        "query_type": "composed", "chart_type": "composed",
+                        "title": f"Core KPIs — {site_ids[0]}",
+                        "x_axis": "date", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "response": f"Showing core network KPIs for {site_ids[0]}.",
+                    }
+                else:
+                    _core_sort = "auth_sr ASC" if _horder == "ASC" else "auth_sr DESC"
+                    return {
+                        "sql": f"""SELECT c.site_id, AVG(c.auth_sr) AS auth_sr, AVG(c.cpu_util) AS cpu_util,
+                                   AVG(c.attach_sr) AS attach_sr, AVG(c.pdp_sr) AS pdp_sr
+                            FROM core_kpi_data c
+                            WHERE c.site_id IS NOT NULL {date_clause}
+                            GROUP BY c.site_id ORDER BY {_core_sort} NULLS LAST {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _horder=='ASC' else 'Top'} {_hn} — Core KPIs",
+                        "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "response": f"{'Worst' if _horder=='ASC' else 'Top'} {_hn} sites by core KPIs.",
+                    }
+            else:
+                # Fallback to flexible_kpi_uploads EAV
+                return {
+                    "sql": f"""SELECT f.site_id, f.column_name, f.num_value
+                        FROM flexible_kpi_uploads f
+                        WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+                          {site_filter_f}
+                        ORDER BY f.site_id, f.column_name""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": "Core KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
+                    "x_axis": "site_id", "y_axes": ["num_value"],
+                    "response": "Showing core network KPIs (from uploaded data).",
+                }
+
+        # ── Transport/backhaul queries ──
+        if _is_transport:
+            if _tbl_exists("transport_kpi_data"):
+                _trans_sort = "packet_loss" if any(w in p for w in ('packet loss', 'loss')) else \
+                              "avg_latency" if any(w in p for w in ('latency', 'delay')) else \
+                              "jitter" if 'jitter' in p else "packet_loss"
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
+                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                            FROM transport_kpi_data t
+                            WHERE t.site_id IS NOT NULL {site_filter_t}
+                            ORDER BY t.site_id""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Transport KPIs — {', '.join(site_ids[:2])}",
+                        "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
+                        "response": f"Transport/backhaul KPIs for {', '.join(site_ids[:2])}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
+                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                            FROM transport_kpi_data t
+                            WHERE t.site_id IS NOT NULL
+                            ORDER BY {_trans_sort} DESC NULLS LAST {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Top {_hn} — Transport Issues (by {_trans_sort})",
+                        "x_axis": "site_id", "y_axes": ["packet_loss", "avg_latency", "jitter"],
+                        "response": f"Top {_hn} sites with worst transport KPIs (by {_trans_sort}).",
+                    }
+            else:
+                return {
+                    "sql": "", "query_type": "bar", "chart_type": "bar",
+                    "title": "Transport KPIs", "x_axis": "site_id", "y_axes": [],
+                    "response": "No transport data available. Please upload transport KPI data via the admin panel.",
+                }
+
+        # ── Network issue ticket queries ──
+        if _is_ticket:
+            if _tbl_exists("network_issue_tickets"):
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
+                                   n.violations, n.status, n.zone, n.created_at::text
+                            FROM network_issue_tickets n
+                            WHERE n.status IN ('open','in_progress') {site_filter_n}
+                            ORDER BY n.priority_score DESC""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Network Tickets — {', '.join(site_ids[:2])}",
+                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "response": f"Network issue tickets for {', '.join(site_ids[:2])}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
+                                   n.violations, n.status, n.zone, n.created_at::text
+                            FROM network_issue_tickets n
+                            WHERE n.status IN ('open','in_progress')
+                            ORDER BY n.priority_score DESC {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Top {_hn} Network Issue Tickets",
+                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "response": f"Showing {_hn} highest-priority open tickets.",
+                    }
+            else:
+                return {
+                    "sql": "", "query_type": "bar", "chart_type": "bar",
+                    "title": "Network Tickets", "x_axis": "site_id", "y_axes": [],
+                    "response": "No network issue tickets found. The AI ticket system generates tickets during the daily 08:00 IST scan.",
+                }
 
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
     # Previously this incorrectly paired kpi[i] with site[i].
@@ -1388,7 +2102,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         sql = _kd_site_query([("LTE Intra-Freq HO Success Rate","intra_freq_ho_sr"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"intra_freq_ho_sr","ASC")
         return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — HO Success Rate","x_axis":"site_id","y_axes":["intra_freq_ho_sr"],"response":f"Showing {N} sites with worst Handover Success Rate."}
 
-    if 'drop' in p or 'cdr' in p:
+    if 'drop rate' in p or 'call drop' in p or 'call failure' in p or 'cdr' in p:
         sql = _kd_site_query([("E-RAB Call Drop Rate_1","erab_drop_rate"),("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput")],"erab_drop_rate","DESC")
         return {"sql":sql,"query_type":"bar","title":f"Top {N} Call Drop Offenders","x_axis":"site_id","y_axes":["erab_drop_rate","dl_prb_util"],"response":f"Showing {N} sites with highest E-RAB call drop rate."}
 
@@ -1405,7 +2119,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         sql = _kd_site_query([("LTE Call Setup Success Rate","lte_cssr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("E-RAB Call Drop Rate_1","erab_drop_rate")],"lte_cssr","ASC")
         return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Call Setup Success","x_axis":"site_id","y_axes":["lte_cssr","erab_setup_sr"],"response":f"Showing {N} sites with lowest CSSR."}
 
-    if 'zone' in p or 'cluster' in p or 'cbd' in p or 'urban' in p or 'compar' in p:
+    if 'zone' in p or 'cluster' in p or 'cbd' in p or 'urban' in p or 'compare' in p or 'comparison' in p:
         return {"sql":f"""SELECT ts.zone AS cluster, COUNT(DISTINCT k.site_id) AS sites,
                        AVG(CASE WHEN k.kpi_name='DL PRB Utilization (1BH)' THEN k.value END) AS avg_prb,
                        AVG(CASE WHEN k.kpi_name='LTE DL - Cell Ave Throughput' THEN k.value END) AS avg_tput,
@@ -1417,7 +2131,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 GROUP BY ts.zone ORDER BY avg_prb DESC NULLS LAST""",
                 "query_type":"bar","title":"Zone-wise KPI Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput","avg_drop"],"response":"Zone-level KPI comparison."}
 
-    if 'availab' in p or 'downtime' in p or 'uptime' in p:
+    if 'availability' in p or 'downtime' in p or 'uptime' in p:
         sql = _kd_site_query([("Availability","availability"),("DL PRB Utilization (1BH)","dl_prb_util")],"availability","ASC")
         return {"sql":sql,"query_type":"bar","title":"Sites with Lowest Availability","x_axis":"site_id","y_axes":["availability"],"response":"Sites with lowest availability."}
 
@@ -1429,7 +2143,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         sql = _kd_site_query([("DL Data Total Volume","dl_volume"),("UL Data Total Volume","ul_volume"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_volume","DESC")
         return {"sql":sql,"query_type":"bar","title":f"Top {N} by Data Volume","x_axis":"site_id","y_axes":["dl_volume","ul_volume"],"response":f"Showing {N} sites with highest data volume."}
 
-    if 'user' in p or 'ue' in p or 'connected' in p:
+    if 'connected' in p or re.search(r'\busers?\b', p) or re.search(r'\bue\b', p):
         sql = _kd_site_query([("Ave RRC Connected Ue","avg_rrc_ue"),("Max RRC Connected Ue","max_rrc_ue"),("DL PRB Utilization (1BH)","dl_prb_util")],"avg_rrc_ue","DESC")
         return {"sql":sql,"query_type":"bar","title":f"Top {N} by Connected Users","x_axis":"site_id","y_axes":["avg_rrc_ue","max_rrc_ue"],"response":f"Showing {N} sites with most users."}
 
@@ -1451,7 +2165,7 @@ def _rule_based_legacy(p: str, time_filter: str) -> dict:
         return {"sql": f"SELECT site_id, cluster, AVG(lte_rrc_setup_sr) as lte_rrc_setup_sr, AVG(erab_setup_sr) as erab_setup_sr, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY lte_rrc_setup_sr ASC NULLS LAST LIMIT {N}", "query_type":"bar","title":f"RRC — Bottom {N} Sites","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Bottom {N} sites by RRC SR."}
     if 'volte' in p:
         return {"sql": f"SELECT site_id, cluster, AVG(volte_traffic_erl) as volte_traffic_erl, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY volte_traffic_erl DESC NULLS LAST LIMIT {N}", "query_type":"bar","title":f"VoLTE — Top {N}","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Top {N} sites by VoLTE Erlang."}
-    if 'drop' in p or 'cdr' in p:
+    if 'drop rate' in p or 'call drop' in p or 'call failure' in p or 'cdr' in p:
         return {"sql": f"SELECT site_id, cluster, AVG(COALESCE(erab_drop_rate,call_drop_rate,0)) as erab_drop_rate, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY erab_drop_rate DESC NULLS LAST LIMIT {N}", "query_type":"mixed","title":f"Call Drop — Top {N}","x_axis":"site_id","y_axes":["erab_drop_rate","avg_prb"],"response":f"Top {N} call drop sites."}
     if 'zone' in p or 'compar' in p or 'cluster' in p:
         return {"sql": f"SELECT cluster, COUNT(DISTINCT site_id) as sites, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(COALESCE(dl_cell_tput,throughput_dl)) as avg_tput {base} GROUP BY cluster ORDER BY avg_prb DESC", "query_type":"bar","title":"Zone Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput"],"response":"Zone KPI comparison."}
